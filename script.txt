@@ -1,0 +1,1 @@
+loadstring(game:HttpGet("https://github.com/micdihishard/Pistol-arena-script/blob/main/main.lua"))()
