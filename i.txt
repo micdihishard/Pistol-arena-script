@@ -1,0 +1,4 @@
+getgenv().DoServerHop = false -- change to false if you want to disable server hop on start of the script
+loadstring(game:HttpGet("https://gitlab.com/zkay404-group/ProjectYielding/-/raw/main/ZKSuryuFarm"))()
+
+PY-Y1HG-TNMX-2PP0-9H4T
