@@ -1,1 +1,4 @@
 loadstring(game:HttpGet("https://github.com/micdihishard/Pistol-arena-script/blob/main/main.lua"))()
+
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/micdihishard/Pistol-arena-script/refs/heads/main/message (13).txt"))()
