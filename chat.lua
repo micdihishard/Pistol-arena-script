@@ -1164,4 +1164,5 @@ do
             return
         end
         if not dragging then return end
-        local t ... (44 KB left)
+        local t 
+... (44 KB left)
