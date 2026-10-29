@@ -14,6 +14,30 @@ local function LOG(step, msg, ...)
 end
 LOG("boot", "script start (Autoexecute)")
 
+-- Re-execution guard: an older copy must stop before it can fight the new copy
+-- over the topbar chip, the GUI parent, or the chat feed.
+local GENERATION_KEY = "__VEZ_CHAT_GENERATION"
+local GENV = _G
+pcall(function()
+    if type(getgenv) == "function" then
+        local g = getgenv()
+        if type(g) == "table" then GENV = g end
+    end
+end)
+local generation = 1
+local generationShared = false
+pcall(function()
+    local prev = tonumber(GENV[GENERATION_KEY]) or 0
+    generation = prev + 1
+    GENV[GENERATION_KEY] = generation
+    generationShared = true
+end)
+local function generationCurrent()
+    if not generationShared then return true end
+    local ok, cur = pcall(function() return tonumber(GENV[GENERATION_KEY]) end)
+    return not ok or cur == nil or cur == generation
+end
+
 -- ================= SAFE BOOT (Delta Autoexecute runs VERY early) =================
 -- Old failure mode: game not loaded / LocalPlayer nil / PlayerGui not replicated yet
 -- -> gui parented to nil, invisible, looks like "fails to load sometimes".
@@ -26,6 +50,7 @@ do
             game.Loaded:Wait()
             done = true
         end)
+        if not generationCurrent() then return end
         LOG("boot", "game.Loaded fired (done=%s)", tostring(done))
     else
         LOG("boot", "game already loaded (ok=%s)", tostring(ok))
@@ -59,6 +84,13 @@ local function hideDefaultChat()
         end
         slotOK = true
     end)
+    -- pcall success only means the closure ran; verify the slot actually reads enabled
+    if slotOK then
+        pcall(function()
+            local sg = game:GetService("StarterGui")
+            slotOK = sg:GetCoreGuiEnabled(Enum.CoreGuiType.Chat) == true
+        end)
+    end
     local cfgOK = false
     pcall(function()
         local cw = TCS:FindFirstChildOfClass("ChatWindowConfiguration")
@@ -82,8 +114,9 @@ end
 -- keep the slot alive and the window hidden without needing to re-execute.
 task.spawn(function()
     local last = chatHiddenState
-    while true do
+    while generationCurrent() do
         task.wait(2)
+        if not generationCurrent() then break end
         local slotOK, cfgOK = hideDefaultChat()
         local state = tostring(slotOK) .. ":" .. tostring(cfgOK)
         if state ~= last then
@@ -117,6 +150,41 @@ local SIDECAR_PATHS = {
 -- Legacy visible tag from older copies; stripped so it never shows in Normal.
 local GLOBAL_TAG = "[GLOBAL] "
 
+-- Last-resort recovery when the game/executor destroys our ScreenGui.  A
+-- destroyed ScreenGui also destroys all of its descendants, so re-running the
+-- source is the only way to rebuild the panel.  The generation guard above
+-- makes the old copy exit instead of fighting the new one.
+local RELOAD_KEY = "__VEZ_CHAT_LAST_RELOAD"
+local lastReload = 0
+local function reloadSelf(reason)
+    if not generationCurrent() then return false end
+    if type(loadstring) ~= "function" or type(readfile) ~= "function" then
+        LOG("ui", "self reload unavailable (%s)", tostring(reason))
+        return false
+    end
+    local now = os.time()
+    local last = lastReload
+    pcall(function() last = tonumber(GENV[RELOAD_KEY]) or last end)
+    if now - last < 20 then return false end
+    lastReload = now
+    pcall(function() GENV[RELOAD_KEY] = now end)
+    for _, path in ipairs(SCRIPT_PATHS) do
+        local ok, src = pcall(readfile, path)
+        if ok and type(src) == "string" and #src > 1000 then
+            local fn, err = loadstring(src, "=VEZChatReload")
+            if fn then
+                LOG("ui", "self reload (%s) from %s", tostring(reason), path)
+                local okRun, runErr = pcall(fn)
+                if not okRun then LOG("ui", "self reload failed: %s", tostring(runErr)) end
+                return true
+            end
+            LOG("ui", "self reload compile failed: %s", tostring(err))
+        end
+    end
+    LOG("ui", "self reload source unavailable (%s)", tostring(reason))
+    return false
+end
+
 local BG = Color3.fromRGB(21, 21, 28)
 local PANEL = Color3.fromRGB(33, 33, 42)
 local ACCENT = Color3.fromRGB(0, 132, 220)
@@ -133,13 +201,14 @@ local locked = false
 local lp = nil
 do
     local tries = 0
-    while not lp and tries < 120 do
+    while not lp and tries < 120 and generationCurrent() do
         pcall(function() lp = Players.LocalPlayer end)
         if lp then break end
         tries = tries + 1
         if tries % 10 == 1 then LOG("boot", "waiting LocalPlayer... try %d", tries) end
         task.wait(0.5)
     end
+    if not generationCurrent() then return end
     if not lp then
         LOG("boot", "FATAL: LocalPlayer never appeared, aborting")
         return
@@ -168,8 +237,11 @@ local function doRequest(url, method, body)
         if ok and res then
             local b = res.Body or res.body or ""
             local code = res.StatusCode or res.status_code or res.Status or 0
-            if b ~= "" or (code >= 200 and code < 300) then
-                return true, { Body = b, Success = (code >= 200 and code < 300) }
+            local success = (code >= 200 and code < 300)
+            -- Some executors omit StatusCode but still return a valid body.
+            if code == 0 and b ~= "" and res.Success ~= false then success = true end
+            if b ~= "" or success then
+                return true, { Body = b, Success = success }
             else
                 LOG("http", "execReq empty: code=%s url=%s", tostring(code), url)
             end
@@ -217,6 +289,7 @@ local parentGui, parentHow = resolveParent()
 if not parentGui then
     LOG("ui", "parent not ready, waiting PlayerGui (up to 30s)...")
     pcall(function() lp:WaitForChild("PlayerGui", 30) end)
+    if not generationCurrent() then return end
     parentGui, parentHow = resolveParent()
 end
 -- keep retrying in background if still nil; re-parent GUI once it appears
@@ -224,6 +297,7 @@ if typeof(parentGui) ~= "Instance" then
     pcall(function() parentGui = game:GetService("CoreGui") end)
     if typeof(parentGui) == "Instance" then parentHow = "CoreGui" end
 end
+if not generationCurrent() then return end
 LOG("ui", "parent: %s (%s)", parentGui and (parentGui.ClassName .. "/" .. parentGui.Name) or "NIL", parentHow or "?")
 if typeof(parentGui) ~= "Instance" then
     LOG("ui", "FATAL: no UI parent, aborting (will retry next Autoexecute)")
@@ -241,10 +315,15 @@ pcall(function()
     pcall(function() if typeof(get_hui) == "function" then push(get_hui()) end end)
     pcall(function() push(game:GetService("CoreGui")) end)
     for _, r in ipairs(roots) do
-        for _, c in ipairs(r:GetChildren()) do
-            if c.Name == "VEZChat" then
-                pcall(function() c:Destroy() end)
-                LOG("ui", "removed duplicate VEZChat from %s", r:GetFullName())
+        local okChildren, children = pcall(function() return r:GetChildren() end)
+        if okChildren and children then
+            for _, c in ipairs(children) do
+                if c.Name == "VEZChat" then
+                    pcall(function() c:Destroy() end)
+                    local where = "?"
+                    pcall(function() where = r:GetFullName() end)
+                    LOG("ui", "removed duplicate VEZChat from %s", where)
+                end
             end
         end
         local okDesc, list = pcall(function() return r:GetDescendants() end)
@@ -252,18 +331,21 @@ pcall(function()
             for _, d in ipairs(list) do
                 if d.Name == "VEZChatTopbar" then
                     pcall(function() d:Destroy() end)
-                    LOG("ui", "removed stale topbar chip from %s", r:GetFullName())
+                    local where = "?"
+                    pcall(function() where = r:GetFullName() end)
+                    LOG("ui", "removed stale topbar chip from %s", where)
                 end
             end
         end
     end
 end)
+if not generationCurrent() then return end
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "VEZChat"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
-gui.DisplayOrder = 999
+gui.DisplayOrder = 999999
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
 local okParent, errParent = pcall(function() gui.Parent = parentGui end)
@@ -274,16 +356,46 @@ if not okParent then
 end
 -- if PlayerGui arrives late / executor hui swaps, re-parent so we never stay invisible
 task.spawn(function()
-    for i = 1, 20 do
-        task.wait(1.5)
-        local ok = pcall(function() return gui.Parent end)
-        if not ok or not gui.Parent then
+    local warned = false
+    local failures = 0
+    local enabledWarned = false
+    while generationCurrent() do
+        task.wait(2)
+        if not generationCurrent() then break end
+        local ok, parent = pcall(function() return gui.Parent end)
+        if not ok or not parent then
+            failures = failures + 1
             local np, how = resolveParent()
             if typeof(np) == "Instance" then
-                pcall(function() gui.Parent = np end)
-                LOG("ui", "re-parented GUI to %s (%s)", np:GetFullName(), how)
-                break
+                local okp = pcall(function() gui.Parent = np end)
+                if okp then
+                    LOG("ui", "re-parented GUI to %s (%s)", np:GetFullName(), how)
+                    warned, failures, enabledWarned = false, 0, false
+                elseif not warned then
+                    warned = true
+                    LOG("ui", "GUI has no parent and cannot be re-parented (%s)", how)
+                end
+            elseif not warned then
+                warned = true
+                LOG("ui", "GUI has no parent and no UI parent is available")
             end
+            if failures >= 3 then
+                failures = 0
+                task.spawn(function() reloadSelf("ScreenGui destroyed or unparentable") end)
+            end
+        else
+            warned, failures = false, 0
+            pcall(function()
+                if gui.Enabled == false then
+                    gui.Enabled = true
+                    if not enabledWarned then
+                        enabledWarned = true
+                        LOG("ui", "GUI was disabled; re-enabled it")
+                    end
+                else
+                    enabledWarned = false
+                end
+            end)
         end
     end
 end)
@@ -376,6 +488,22 @@ local msgPad = Instance.new("UIPadding")
 msgPad.PaddingRight = UDim.new(0, 4)
 msgPad.Parent = msgs
 
+local renderFeed
+local activeTab = "Private"
+local togglePanel
+local lastChipTap = -1
+local function chipTap(source)
+    if not generationCurrent() then return end
+    local now = os.clock()
+    if now - lastChipTap < 0.4 then return end
+    lastChipTap = now
+    if togglePanel then
+        togglePanel(source)
+    else
+        main.Visible = not main.Visible
+        LOG("ui", "%s tapped -> panel visible=%s", tostring(source), tostring(main.Visible))
+    end
+end
 local function scrollMsgsBottom()
     task.defer(function()
         pcall(function()
@@ -720,25 +848,35 @@ LOG("ui", "floatBtn created size=%d (chip, movable, icon=%s)", FLOAT_SIZE, tostr
 
 local unread = 0
 local topbarBadge = nil
+local function badgeAlive(badge)
+    if not badge then return false end
+    local ok, parent = pcall(function() return badge.Parent end)
+    return ok and parent ~= nil
+end
 local function refreshFloat()
-    local countText = unread > 99 and "99+" or tostring(unread)
-    local badge = unreadBadge or topbarBadge
-    if unread > 0 then
-        if badge then
-            badge.Text = countText
-            badge.Visible = true
-        else
-            floatBtn.Text = countText
-            floatBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+    pcall(function()
+        local countText = unread > 99 and "99+" or tostring(unread)
+        if unreadBadge and not badgeAlive(unreadBadge) then unreadBadge = nil end
+        if topbarBadge and not badgeAlive(topbarBadge) then topbarBadge = nil end
+        local floatHasBadge = unreadBadge ~= nil
+        if unreadBadge then
+            unreadBadge.Text = countText
+            unreadBadge.Visible = unread > 0
         end
-    else
-        if badge then
-            badge.Visible = false
-        else
-            floatBtn.Text = "CHAT"
-            floatBtn.BackgroundColor3 = ICON_BG
+        if topbarBadge then
+            topbarBadge.Text = countText
+            topbarBadge.Visible = unread > 0
         end
-    end
+        if not floatHasBadge then
+            if unread > 0 then
+                floatBtn.Text = countText
+                floatBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+            else
+                floatBtn.Text = "CHAT"
+                floatBtn.BackgroundColor3 = ICON_BG
+            end
+        end
+    end)
 end
 
 -- ================= topbar slot overlay =================
@@ -772,6 +910,24 @@ local function objectImage(o)
     return ""
 end
 
+-- Never treat a hidden "Chat" entry in the avatar/settings dropdown as the
+-- topbar chat slot.  Walking up from such an entry used to land on the
+-- player's headshot button, which put our 42px chip over the avatar.
+local TOPBAR_BAD = {
+    "headshot", "avatar", "profile", "playerlist", "leaderboard",
+    "friends", "party", "platform", "settings", "emote",
+    "backpack", "inventory", "shop", "robux", "notification",
+    "hamburger", "home", "voice", "microphone", "leave", "report",
+    "dropdown", "contextmenu", "popup",
+}
+local function topbarHostBad(full)
+    full = tostring(full or ""):lower()
+    for _, token in ipairs(TOPBAR_BAD) do
+        if full:find(token, 1, true) then return token end
+    end
+    return nil
+end
+
 local function scoreChatCandidate(o)
     local score = 0
     local name = ""
@@ -789,6 +945,7 @@ local function scoreChatCandidate(o)
     if img:find("chat", 1, true) then score = score + 25 end
     local full = ""
     pcall(function() full = o:GetFullName():lower() end)
+    if topbarHostBad(full) then score = score - 100 end
     if full:find("topbarapp", 1, true) then score = score + 3 end
     if full:find("leftframe", 1, true) then score = score + 5 end
     if full:find("friends", 1, true) or full:find("party", 1, true)
@@ -831,6 +988,62 @@ local function visibleChain(o)
     return true
 end
 
+local function hostHasChatArt(host)
+    local name = ""
+    pcall(function() name = tostring(host.Name):lower() end)
+    if name:find("chat", 1, true) then return true end
+    if objectImage(host):lower():find("chat", 1, true) then return true end
+    local ok, list = pcall(function() return host:GetDescendants() end)
+    if ok and list then
+        for _, d in ipairs(list) do
+            local dn = ""
+            pcall(function() dn = tostring(d.Name):lower() end)
+            if (dn:find("chat", 1, true)
+                or objectImage(d):lower():find("chat", 1, true))
+                and visibleChain(d) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function topbarHostValid(host)
+    if not host then return false end
+    local okp, parent = pcall(function() return host.Parent end)
+    if not okp or not parent then return false end
+    local okGui, isGui = pcall(function() return host:IsA("GuiObject") end)
+    if not okGui or not isGui then return false end
+    local full, name = "", ""
+    pcall(function() full = host:GetFullName() end)
+    pcall(function() name = host.Name end)
+    full = tostring(full):lower()
+    name = tostring(name):lower()
+    if full:find("vezchattopbar", 1, true) then return false end
+    if topbarHostBad(full) then return false end
+    -- The legacy ChatIcon path is authoritative.  Accept it even if a client
+    -- renamed an ancestor or reports an unexpected AbsoluteSize.
+    if full:find("chaticon", 1, true) then return true end
+    if not (full:find("topbar", 1, true) or full:find("unibar", 1, true)
+        or full:find("chrome", 1, true) or full:find("leftframe", 1, true)
+        or full:find("experience", 1, true) or full:find("hud", 1, true)) then
+        return false
+    end
+    if not hostHasChatArt(host) then return false end
+    local sx, sy = 0, 0
+    pcall(function()
+        local s = host.AbsoluteSize
+        if s then sx, sy = s.X, s.Y end
+    end)
+    -- A topbar icon is small.  A large container with a chat descendant is
+    -- not the slot; attaching there centers the chip over other topbar UI.
+    if (sx > 96 or sy > 96) and name ~= "chat" and name ~= "chaticon"
+        and name ~= "chatbutton" then
+        return false
+    end
+    return true
+end
+
 local function scanChatHost(root, threshold, requireTopbarAncestry)
     local best, bestScore = nil, threshold
     local ok, list = pcall(function() return root:GetDescendants() end)
@@ -845,12 +1058,25 @@ local function scanChatHost(root, threshold, requireTopbarAncestry)
                 or full:find("leftframe", 1, true) or full:find("hud", 1, true)
             if topbarish or not requireTopbarAncestry then
                 local s = scoreChatCandidate(o)
-                if s > 20 and visibleChain(o) then s = s + 40 end
-                if s > bestScore then best, bestScore = o, s end
+                -- Hidden dropdown entries are not the topbar slot.
+                if s > 20 and visibleChain(o) then
+                    s = s + 40
+                    if s > bestScore then best, bestScore = o, s end
+                end
             end
         end
     end
     return best
+end
+
+local lastTopbarReject = nil
+local function noteTopbarReject(host)
+    local full = "?"
+    pcall(function() full = host:GetFullName() end)
+    full = tostring(full)
+    if full == lastTopbarReject then return end
+    lastTopbarReject = full
+    LOG("ui", "topbar host rejected: %s", full)
 end
 
 local function findTopbarChatHost()
@@ -867,7 +1093,10 @@ local function findTopbarChatHost()
         end)
         if legacy and legacy:IsA("GuiObject") then
             local cand = buttonFor(legacy, cg)
-            if visibleChain(cand) then return cand end
+            if visibleChain(cand) then
+                if topbarHostValid(cand) then return cand end
+                noteTopbarReject(cand)
+            end
         end
     end
     local best = top and scanChatHost(top, 20, false) or nil
@@ -878,13 +1107,19 @@ local function findTopbarChatHost()
         best = scanChatHost(cg, 20, true)
     end
     if not best then return nil end
-    return buttonFor(best, cg)
+    local host = buttonFor(best, cg)
+    if visibleChain(host) and topbarHostValid(host) then return host end
+    if visibleChain(best) and topbarHostValid(best) then return best end
+    noteTopbarReject(host or best)
+    return nil
 end
 
 local function hideTopbarArt(host, chip)
     local function hideOne(o)
         if o == nil or o == chip then return end
         if isUnder(o, chip) then return end
+        -- never hide another VEZ chip; a stale copy may still be present
+        if o.Name == "VEZChatTopbar" then return end
         pcall(function()
             if o:IsA("ImageLabel") or o:IsA("ImageButton") then o.ImageTransparency = 1 end
             if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then o.TextTransparency = 1 end
@@ -892,276 +1127,6 @@ local function hideTopbarArt(host, chip)
                 o.BackgroundTransparency = 1
             end
             if o:IsA("UIStroke") then o.Transparency = 1 end
-            -- our chip is the only click target; stop the built-in button from
-            -- also opening/focusing its hidden chat UI when the slot is tapped
-            if o:IsA("GuiButton") then
-                o.Active = false
-                pcall(function() o.Interactable = false end)
-            end
-            if o:IsA("GuiObject") then o.Selectable = false end
-        end)
-    end
-    hideOne(host)
-    local ok, list = pcall(function() return host:GetDescendants() end)
-    if ok and list then
-        for _, d in ipairs(list) do hideOne(d) end
-    end
-end
-
-local function syncTopbarChipSize()
-    if not (topbarChip and topbarHost) then return end
-    local size = FLOAT_SIZE
-    local ok, hs = pcall(function() return topbarHost.AbsoluteSize end)
-    if ok and hs and hs.X and hs.Y then
-        local m = math.min(FLOAT_SIZE, hs.X, hs.Y)
-        if m >= 24 then size = math.floor(m + 0.5) end
-    end
-    local current = -1
-    pcall(function() current = topbarChip.Size.X.Offset end)
-    if current == size then return end
-    topbarChip.Size = UDim2.fromOffset(size, size)
-    local corner = topbarChip:FindFirstChildOfClass("UICorner")
-    if corner then corner.CornerRadius = UDim.new(0, math.floor(size * 0.43)) end
-end
-
-local function buildTopbarChip()
-    local chip = Instance.new("TextButton")
-    chip.Name = "VEZChatTopbar"
-    chip.AnchorPoint = Vector2.new(0.5, 0.5)
-    chip.Position = UDim2.new(0.5, 0, 0.5, 0)
-    chip.Size = UDim2.fromOffset(FLOAT_SIZE, FLOAT_SIZE)
-    chip.BackgroundColor3 = ICON_BG
-    chip.BackgroundTransparency = 0
-    chip.BorderSizePixel = 0
-    chip.Text = chatIconImage and "" or "CHAT"
-    chip.TextColor3 = Color3.fromRGB(255, 255, 255)
-    chip.TextSize = 7
-    chip.TextScaled = true
-    chip.Font = Enum.Font.GothamBold
-    chip.AutoButtonColor = true
-    chip.Active = true
-    chip.Visible = true
-    chip.ZIndex = 1000
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 18)
-    corner.Parent = chip
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(255, 255, 255)
-    stroke.Transparency = 0.75
-    stroke.Thickness = 1
-    stroke.Parent = chip
-    local pad = Instance.new("UIPadding")
-    pad.PaddingLeft = UDim.new(0, 2)
-    pad.PaddingRight = UDim.new(0, 2)
-    pad.PaddingTop = UDim.new(0, 2)
-    pad.PaddingBottom = UDim.new(0, 2)
-    pad.Parent = chip
-    if chatIconImage then
-        local icon = Instance.new("ImageLabel")
-        icon.Name = "Icon"
-        icon.AnchorPoint = Vector2.new(0.5, 0.5)
-        icon.Size = UDim2.fromScale(0.848, 0.848)
-        icon.Position = UDim2.fromScale(0.5, 0.5)
-        icon.BackgroundTransparency = 1
-        icon.Image = chatIconImage
-        icon.ScaleType = Enum.ScaleType.Fit
-        icon.Active = false
-        icon.ZIndex = 1001
-        icon.Parent = chip
-        task.delay(3, function()
-            local loaded = false
-            pcall(function() loaded = icon.IsLoaded == true end)
-            if not loaded and icon.Parent then
-                icon:Destroy()
-                if chip.Parent then
-                    chip.Text = "CHAT"
-                    chip.BackgroundColor3 = ICON_BG
-                end
-            end
-        end)
-    end
-    local badge = unreadBadge
-    if not badge then
-        badge = Instance.new("TextLabel")
-        badge.Name = "Unread"
-        badge.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
-        badge.BorderSizePixel = 0
-        badge.Text = ""
-        badge.TextColor3 = Color3.fromRGB(255, 255, 255)
-        badge.Font = Enum.Font.GothamBold
-        badge.TextScaled = true
-        badge.Visible = false
-        topbarBadge = badge
-        Instance.new("UICorner", badge).CornerRadius = UDim.new(1, 0)
-    end
-    badge.AnchorPoint = Vector2.new(1, 0)
-    badge.Position = UDim2.new(1, 0, 0, 0)
-    badge.Size = UDim2.new(0, 12, 0, 12)
-    badge.ZIndex = 1002
-    badge.Parent = chip
-    chip.MouseButton1Click:Connect(function()
-        main.Visible = not main.Visible
-        LOG("ui", "topbar tapped -> panel visible=%s", tostring(main.Visible))
-        if main.Visible then
-            unread = 0
-            refreshFloat()
-            scrollMsgsBottom()
-        end
-    end)
-    return chip
-end
-
-local function topbarAttached()
-    if not (topbarChip and topbarHost) then return false end
-    local ok1, cp = pcall(function() return topbarChip.Parent end)
-    if not ok1 or cp ~= topbarHost then return false end
-    local ok2, hp = pcall(function() return topbarHost.Parent end)
-    return ok2 and hp ~= nil
-end
-
-local function detachTopbarChip()
-    if topbarBadge then
-        pcall(function() topbarBadge:Destroy() end)
-        topbarBadge = nil
-    end
-    if unreadBadge then
-        local okRep = pcall(function()
-            unreadBadge.Parent = floatBtn
-            unreadBadge.AnchorPoint = Vector2.new(1, 0)
-            unreadBadge.Position = UDim2.new(1, 0, 0, 0)
-            unreadBadge.Size = UDim2.new(0, 12, 0, 12)
-            unreadBadge.ZIndex = 3
-        end)
-        local okP, parent = pcall(function() return unreadBadge.Parent end)
-        if not okRep or not okP or parent ~= floatBtn then
-            unreadBadge = nil
-        end
-    end
-    if topbarChip then pcall(function() topbarChip:Destroy() end) end
-    topbarChip, topbarHost = nil, nil
-    floatBtn.Visible = true
-    refreshFloat()
-end
-
-local function attachTopbarChip()
-    if topbarChip and topbarHost then
-        if topbarAttached() then
-            syncTopbarChipSize()
-            return true
-        end
-        detachTopbarChip()
-    end
-    local host = findTopbarChatHost()
-    if not host then return false end
-    local ok, err = pcall(function()
-        local chip = buildTopbarChip()
-        topbarChip, topbarHost = chip, host
-        chip.Parent = host
-        hideTopbarArt(host, chip)
-        syncTopbarChipSize()
-    end)
-    if not ok then
-        LOG("ui", "topbar chip attach failed: %s", tostring(err))
-        detachTopbarChip()
-        return false
-    end
-    task.defer(function() syncTopbarChipSize() end)
-    floatBtn.Visible = not visibleChain(topbarHost)
-    local full = "?"
-    pcall(function() full = topbarHost:GetFullName() end)
-    LOG("ui", "topbar chip attached to %s (pill visible=%s)",
-        tostring(full), tostring(floatBtn.Visible))
-    refreshFloat()
-    return true
-end
-
-do
-    if attachTopbarChip() then
-        LOG("ui", "floating pill hidden (topbar slot active)")
-    else
-        LOG("ui", "topbar chat slot not found yet; floating pill active")
-    end
-end
-task.spawn(function()
-    local misses = 0
-    while true do
-        task.wait(2)
-        if topbarAttached() then
-            misses = 0
-            syncTopbarChipSize()
-            -- built-in chat may repaint its icon/badge; keep its art hidden
-            hideTopbarArt(topbarHost, topbarChip)
-            if topbarChip.ZIndex ~= 1000 then topbarChip.ZIndex = 1000 end
-            -- if the topbar itself is hidden, keep the floating pill as fallback
-            local showPill = not visibleChain(topbarHost)
-            if floatBtn.Visible ~= showPill then floatBtn.Visible = showPill end
-        else
-            if topbarChip or topbarHost then
-                LOG("ui", "topbar chip lost; falling back to floating pill")
-                detachTopbarChip()
-            end
-            if misses < 30 then
-                misses = misses + 1
-                if attachTopbarChip() then
-                    misses = 0
-                    LOG("ui", "floating pill hidden (topbar slot active)")
-                end
-            end
-            if misses == 30 then
-                LOG("ui", "topbar chat slot unavailable after retries; keeping floating pill")
-                misses = 31
-            end
-        end
-    end
-end)
-
--- viewport helper: read camera FRESH every call (old code cached it once -> bad clamp after rotation/resize)
-local function viewport()
-    local cam = nil
-    pcall(function() cam = workspace.CurrentCamera end)
-    if cam then return cam.ViewportSize end
-    return Vector2.new(800, 600)
-end
-
--- ================= movable PANEL (drag header, mouse + touch) =================
-local function panelAbs()
-    local vs = viewport()
-    local p = main.Position
-    return p.X.Scale * vs.X + p.X.Offset, p.Y.Scale * vs.Y + p.Y.Offset
-end
-local function clampPanelPos(ax, ay)
-    local vs = viewport()
-    local w, h = main.AbsoluteSize.X, main.AbsoluteSize.Y
-    if w <= 0 then w = MIN_W end
-    if h <= 0 then h = MIN_H end
-    return UDim2.new(0, math.clamp(ax, 0, math.max(0, vs.X - w)),
-        0, math.clamp(ay, 0, math.max(0, vs.Y - h)))
-end
-do
-    local ax, ay = panelAbs()
-    main.Position = clampPanelPos(ax, ay)
-end
-do
-    local dragging, lastPos = false, nil
-    -- grabs land on the tab buttons (they cover the header), so drag from them too
-    local function beginDrag(input)
-        if dragging then return end
-        if locked then LOG("drag", "panel drag blocked (locked)") return end
-        local t = input.UserInputType
-        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
-            dragging, lastPos = true, input.Position
-            LOG("drag", "panel drag start")
-        end
-    end
-    header.InputBegan:Connect(beginDrag)
-    for _, tb in pairs(tabBtns) do
-        tb.InputBegan:Connect(beginDrag)
-    end
-    UIS.InputChanged:Connect(function(input)
-        local st = input.UserInputState
-        if st == Enum.UserInputState.End or st == Enum.UserInputState.Cancel then
-            if dragging then dragging = false LOG("drag", "panel drag end (cancel)") end
-            return
-        end
-        if not dragging then return end
-        local t
+            -- our chip is the only click target; stop the built-in button and
+            -- any invisible touch frame from 
+... (64 KB left)
