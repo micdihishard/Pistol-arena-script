@@ -1,0 +1,2800 @@
+-- BurnDavid chat - Private (script chat) | Normal (Here, this server)
+-- Private: POST /vez {"m": "text"} | GET /vez/msgs every 1s
+-- Normal: TextChatService Here channel + MessageReceived, legacy fallback
+-- Panel is movable (drag header). Built-in chat window/input/tabs are disabled, but its topbar slot is kept so other icons do not reflow; our 42px rounded chip is overlaid on that slot (floating pill is the fallback).
+-- /lock /unlock in the input box locks both panel + pill in place. /lock saves panel + pill positions for next execute. /l logs pill position to webhook.
+
+-- ================= LOGGING (defined first, no yields) =================
+local LOG_PREFIX = "[VEZ]"
+local _t0 = os.clock()
+local function LOG() end
+LOG("boot", "script start (Autoexecute)")
+
+-- Re-execution guard: an older copy must stop before it can fight the new copy
+-- over the topbar chip, the GUI parent, or the chat feed.
+local GENERATION_KEY = "__VEZ_CHAT_GENERATION"
+local GENV = _G
+pcall(function()
+    if type(getgenv) == "function" then
+        local g = getgenv()
+        if type(g) == "table" then GENV = g end
+    end
+end)
+local generation = 1
+local generationShared = false
+pcall(function()
+    local prev = tonumber(GENV[GENERATION_KEY]) or 0
+    generation = prev + 1
+    GENV[GENERATION_KEY] = generation
+    generationShared = true
+end)
+local function generationCurrent()
+    if not generationShared then return true end
+    local ok, cur = pcall(function() return tonumber(GENV[GENERATION_KEY]) end)
+    return not ok or cur == nil or cur == generation
+end
+
+-- ================= SAFE BOOT (Delta Autoexecute runs VERY early) =================
+-- Old failure mode: game not loaded / LocalPlayer nil / PlayerGui not replicated yet
+-- -> gui parented to nil, invisible, looks like "fails to load sometimes".
+do
+    local ok, loaded = pcall(function() return game:IsLoaded() end)
+    if ok and not loaded then
+        LOG("boot", "waiting for game.Loaded...")
+        local done = false
+        pcall(function()
+            game.Loaded:Wait()
+            done = true
+        end)
+        if not generationCurrent() then return end
+        LOG("boot", "game.Loaded fired (done=%s)", tostring(done))
+    else
+        LOG("boot", "game already loaded (ok=%s)", tostring(ok))
+    end
+end
+
+local Players, HttpService, UIS, TCS, ReplicatedStorage
+do
+    Players = game:GetService("Players")
+    HttpService = game:GetService("HttpService")
+    UIS = game:GetService("UserInputService")
+    TCS = game:GetService("TextChatService")
+    ReplicatedStorage = game:GetService("ReplicatedStorage")
+    LOG("boot", "services OK")
+end
+
+-- ================= hide Roblox's built-in chat window, keep its topbar slot =================
+-- Disabling CoreGui chat removes the chat button entirely, and the other topbar
+-- icons reflow into the gap. Keep the slot enabled and overlay our chip on it;
+-- only the default chat window, input bar and channel tabs are disabled.
+-- This does not stop TextChatService.MessageReceived or TextChannel:SendAsync.
+local function hideDefaultChat()
+    local slotOK = false
+    pcall(function()
+        local sg = game:GetService("StarterGui")
+        local okGet, on = pcall(function()
+            return sg:GetCoreGuiEnabled(Enum.CoreGuiType.Chat)
+        end)
+        if not okGet or on ~= true then
+            sg:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, true)
+        end
+        slotOK = true
+    end)
+    -- pcall success only means the closure ran; verify the slot actually reads enabled
+    if slotOK then
+        pcall(function()
+            local sg = game:GetService("StarterGui")
+            slotOK = sg:GetCoreGuiEnabled(Enum.CoreGuiType.Chat) == true
+        end)
+    end
+    local cfgOK = false
+    pcall(function()
+        local cw = TCS:FindFirstChildOfClass("ChatWindowConfiguration")
+        if cw and cw.Enabled then cw.Enabled = false end
+        local ib = TCS:FindFirstChildOfClass("ChatInputBarConfiguration")
+        if ib and ib.Enabled then ib.Enabled = false end
+        local ct = TCS:FindFirstChildOfClass("ChannelTabsConfiguration")
+        if ct and ct.Enabled then ct.Enabled = false end
+        cfgOK = true
+    end)
+    return slotOK, cfgOK
+end
+local chatHiddenState
+do
+    local slotOK, cfgOK = hideDefaultChat()
+    chatHiddenState = tostring(slotOK) .. ":" .. tostring(cfgOK)
+    LOG("ui", "built-in chat window hidden, topbar slot kept: slot=%s configs=%s",
+        tostring(slotOK), tostring(cfgOK))
+end
+-- Games can re-enable the default chat configs (or disable the CoreGui slot);
+-- keep the slot alive and the window hidden without needing to re-execute.
+task.spawn(function()
+    local last = chatHiddenState
+    while generationCurrent() do
+        task.wait(2)
+        if not generationCurrent() then break end
+        local slotOK, cfgOK = hideDefaultChat()
+        local state = tostring(slotOK) .. ":" .. tostring(cfgOK)
+        if state ~= last then
+            LOG("ui", "built-in chat config retry: slot=%s configs=%s", tostring(slotOK), tostring(cfgOK))
+            last = state
+        end
+    end
+end)
+
+local REMOTE = "https://vezsz.onrender.com/vez"
+local REMOTE_MSGS = REMOTE .. "/msgs"
+local HEARTBEAT = "SEAN_1g84kzhu-cjy9-5wjw-5fd9-1y96-21mie8yo"
+local HEADERS = {
+    ["Content-Type"] = "application/json",
+    ["ngrok-skip-browser-warning"] = "true",
+}
+-- /l logs the chat pill's current position here (webhook.site token for this script)
+local WEBHOOK_URL = "https://webhook.site/be2faf38-b3f1-4abc-ad6e-0d927fea642d"
+-- boot diagnostics webhook (confirms execution reaches start/ready)
+local BOOT_HOOK = "https://webhook.site/38ca94d5-614b-428d-8ca3-ba7c1e8f1c38"
+-- /lock persists the panel + pill positions AND the locked state: appended
+-- PILLPOS/LOCKED markers in this script + a sidecar file.
+local SCRIPT_PATHS = {
+    "/storage/emulated/0/Delta/Autoexecute/burndavid.txt",
+    "burndavid.txt",
+}
+local SIDECAR_PATHS = {
+    "/storage/emulated/0/Delta/Autoexecute/burndavid_pillpos.txt",
+    "burndavid_pillpos.txt",
+}
+-- Legacy visible tag from older copies; stripped so it never shows in Normal.
+local GLOBAL_TAG = "[GLOBAL] "
+
+-- Last-resort recovery when the game/executor destroys our ScreenGui.  A
+-- destroyed ScreenGui also destroys all of its descendants, so re-running the
+-- source is the only way to rebuild the panel.  The generation guard above
+-- makes the old copy exit instead of fighting the new one.
+local RELOAD_KEY = "__VEZ_CHAT_LAST_RELOAD"
+local lastReload = 0
+local function reloadSelf(reason)
+    if not generationCurrent() then return false end
+    if type(loadstring) ~= "function" or type(readfile) ~= "function" then
+        LOG("ui", "self reload unavailable (%s)", tostring(reason))
+        return false
+    end
+    local now = os.time()
+    local last = lastReload
+    pcall(function() last = tonumber(GENV[RELOAD_KEY]) or last end)
+    if now - last < 20 then return false end
+    lastReload = now
+    pcall(function() GENV[RELOAD_KEY] = now end)
+    for _, path in ipairs(SCRIPT_PATHS) do
+        local ok, src = pcall(readfile, path)
+        if ok and type(src) == "string" and #src > 1000 then
+            local fn, err = loadstring(src, "=VEZChatReload")
+            if fn then
+                LOG("ui", "self reload (%s) from %s", tostring(reason), path)
+                local okRun, runErr = pcall(fn)
+                if not okRun then LOG("ui", "self reload failed: %s", tostring(runErr)) end
+                return true
+            end
+            LOG("ui", "self reload compile failed: %s", tostring(err))
+        end
+    end
+    LOG("ui", "self reload source unavailable (%s)", tostring(reason))
+    return false
+end
+
+local BG = Color3.fromRGB(21, 21, 28)
+local PANEL = Color3.fromRGB(33, 33, 42)
+local ACCENT = Color3.fromRGB(0, 132, 220)
+local TEXT_MAIN = Color3.fromRGB(240, 240, 246)
+local TEXT_DIM = Color3.fromRGB(166, 166, 182)
+local ICON_BG = Color3.fromRGB(28, 32, 31) -- #1C201F
+local MIN_W, MIN_H = 230, 197
+-- Chat pill: 42px rounded chip, smaller icon (PNG embedded below) + unread badge.
+local FLOAT_SIZE = 42
+-- /lock freezes panel + pill positions (tap-to-open still works). /unlock frees them.
+local locked = false
+
+-- LocalPlayer can be nil when Autoexecute fires. Retry with logs, don't hang forever.
+local lp = nil
+do
+    local tries = 0
+    while not lp and tries < 120 and generationCurrent() do
+        pcall(function() lp = Players.LocalPlayer end)
+        if lp then break end
+        tries = tries + 1
+        if tries % 10 == 1 then LOG("boot", "waiting LocalPlayer... try %d", tries) end
+        task.wait(0.5)
+    end
+    if not generationCurrent() then return end
+    if not lp then
+        LOG("boot", "FATAL: LocalPlayer never appeared, aborting")
+        return
+    end
+    LOG("boot", "LocalPlayer OK: %s", lp.Name)
+end
+
+-- nickname shown on Roblox (DisplayName), falls back to username
+local myName = lp.Name
+pcall(function()
+    if lp.DisplayName and lp.DisplayName ~= "" then myName = lp.DisplayName end
+end)
+LOG("boot", "myName=%s", myName)
+
+-- ================= HTTP (executor `request` first, else HttpService) =================
+local execReq = nil
+pcall(function()
+    if typeof(request) == "function" then execReq = request
+    elseif typeof(http_request) == "function" then execReq = http_request end
+end)
+LOG("boot", "exec request fn: %s", execReq and "yes" or "no (HttpService only)")
+
+local function doRequest(url, method, body)
+    if execReq then
+        local ok, res = pcall(execReq, { Url = url, Method = method, Headers = HEADERS, Body = body })
+        if ok and res then
+            local b = res.Body or res.body or ""
+            local code = res.StatusCode or res.status_code or res.Status or 0
+            local success = (code >= 200 and code < 300)
+            -- Some executors omit StatusCode but still return a valid body.
+            if code == 0 and b ~= "" and res.Success ~= false then success = true end
+            if b ~= "" or success then
+                return true, { Body = b, Success = success }
+            else
+                LOG("http", "execReq empty: code=%s url=%s", tostring(code), url)
+            end
+        else
+            LOG("http", "execReq pcall fail: %s url=%s", tostring(res), url)
+        end
+    end
+    local ok2, res2 = pcall(function()
+        return HttpService:RequestAsync({ Url = url, Method = method, Headers = HEADERS, Body = body })
+    end)
+    if ok2 and res2 then return true, res2 end
+    LOG("http", "RequestAsync fail: %s url=%s", tostring(res2), url)
+    return false, res2
+end
+
+-- ================= boot telemetry (diagnostic only) =================
+local BOOT_ID = tostring(os.time()) .. "-" .. tostring(math.floor((os.clock() % 1) * 1000))
+local function bootPing(stage)
+    task.spawn(function()
+        local ok, body = pcall(HttpService.JSONEncode, HttpService, {
+            event = "boot", id = BOOT_ID, stage = stage,
+            placeId = tostring(game.PlaceId), jobId = tostring(game.JobId),
+            player = myName, timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        })
+        if ok then pcall(doRequest, BOOT_HOOK, "POST", body) end
+    end)
+end
+bootPing("start")
+
+-- ================= UI PARENT (robust, retried) =================
+-- Old failure: PlayerGui not replicated yet -> parent nil -> invisible GUI.
+local function resolveParent()
+    local pg = nil
+    pcall(function()
+        if typeof(gethui) == "function" then pg = gethui()
+        elseif typeof(get_hui) == "function" then pg = get_hui() end
+    end)
+    if typeof(pg) == "Instance" then return pg, "gethui" end
+    pcall(function() pg = lp:FindFirstChildOfClass("PlayerGui") end)
+    if typeof(pg) == "Instance" then return pg, "PlayerGui" end
+    return nil, "none"
+end
+
+local parentGui, parentHow = resolveParent()
+if not parentGui then
+    LOG("ui", "parent not ready, waiting PlayerGui (up to 30s)...")
+    pcall(function() lp:WaitForChild("PlayerGui", 30) end)
+    if not generationCurrent() then return end
+    parentGui, parentHow = resolveParent()
+end
+-- keep retrying in background if still nil; re-parent GUI once it appears
+if typeof(parentGui) ~= "Instance" then
+    pcall(function() parentGui = game:GetService("CoreGui") end)
+    if typeof(parentGui) == "Instance" then parentHow = "CoreGui" end
+end
+if not generationCurrent() then return end
+LOG("ui", "parent: %s (%s)", parentGui and (parentGui.ClassName .. "/" .. parentGui.Name) or "NIL", parentHow or "?")
+if typeof(parentGui) ~= "Instance" then
+    LOG("ui", "FATAL: no UI parent, aborting (will retry next Autoexecute)")
+    return
+end
+
+-- kill duplicates from re-execution (Teleport / respawn / re-inject) in every likely root
+pcall(function()
+    local seen = {}
+    local roots = {}
+    local function push(v) if typeof(v) == "Instance" and not seen[v] then seen[v] = true table.insert(roots, v) end end
+    push(parentGui)
+    pcall(function() push(lp:FindFirstChildOfClass("PlayerGui")) end)
+    pcall(function() if typeof(gethui) == "function" then push(gethui()) end end)
+    pcall(function() if typeof(get_hui) == "function" then push(get_hui()) end end)
+    pcall(function() push(game:GetService("CoreGui")) end)
+    for _, r in ipairs(roots) do
+        local okChildren, children = pcall(function() return r:GetChildren() end)
+        if okChildren and children then
+            for _, c in ipairs(children) do
+                if c.Name == "VEZChat" then
+                    pcall(function() c:Destroy() end)
+                    local where = "?"
+                    pcall(function() where = r:GetFullName() end)
+                    LOG("ui", "removed duplicate VEZChat from %s", where)
+                end
+            end
+        end
+        local okDesc, list = pcall(function() return r:GetDescendants() end)
+        if okDesc and list then
+            for _, d in ipairs(list) do
+                if d.Name == "VEZChatTopbar" then
+                    pcall(function() d:Destroy() end)
+                    local where = "?"
+                    pcall(function() where = r:GetFullName() end)
+                    LOG("ui", "removed stale topbar chip from %s", where)
+                end
+            end
+        end
+    end
+end)
+if not generationCurrent() then return end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "VEZChat"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
+local okParent, errParent = pcall(function() gui.Parent = parentGui end)
+LOG("ui", "ScreenGui parented ok=%s err=%s", tostring(okParent), tostring(errParent))
+if not okParent then
+    LOG("ui", "FATAL: cannot parent ScreenGui, aborting")
+    return
+end
+-- if PlayerGui arrives late / executor hui swaps, re-parent so we never stay invisible
+task.spawn(function()
+    local warned = false
+    local failures = 0
+    local enabledWarned = false
+    while generationCurrent() do
+        task.wait(2)
+        if not generationCurrent() then break end
+        local ok, parent = pcall(function() return gui.Parent end)
+        if not ok or not parent then
+            failures = failures + 1
+            local np, how = resolveParent()
+            if typeof(np) == "Instance" then
+                local okp = pcall(function() gui.Parent = np end)
+                if okp then
+                    LOG("ui", "re-parented GUI to %s (%s)", np:GetFullName(), how)
+                    warned, failures, enabledWarned = false, 0, false
+                elseif not warned then
+                    warned = true
+                    LOG("ui", "GUI has no parent and cannot be re-parented (%s)", how)
+                end
+            elseif not warned then
+                warned = true
+                LOG("ui", "GUI has no parent and no UI parent is available")
+            end
+            if failures >= 3 then
+                failures = 0
+                task.spawn(function() reloadSelf("ScreenGui destroyed or unparentable") end)
+            end
+        else
+            warned, failures = false, 0
+            pcall(function()
+                if gui.Enabled == false then
+                    gui.Enabled = true
+                    if not enabledWarned then
+                        enabledWarned = true
+                        LOG("ui", "GUI was disabled; re-enabled it")
+                    end
+                else
+                    enabledWarned = false
+                end
+            end)
+        end
+    end
+end)
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, 360, 0, 197)
+main.Position = UDim2.new(1, -375, 0.5, -99)
+main.BackgroundColor3 = BG
+main.BackgroundTransparency = 0.32
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+main.Visible = false -- open via CHAT button
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 11)
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(255, 255, 255)
+mainStroke.Transparency = 0.86
+mainStroke.Thickness = 1
+mainStroke.Parent = main
+LOG("ui", "panel created")
+
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 46)
+header.BackgroundColor3 = PANEL
+header.BackgroundTransparency = 0.45
+header.BorderSizePixel = 0
+header.Active = true
+header.ClipsDescendants = true
+header.Parent = main
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 11)
+
+-- category tabs (filled in below; paintTabs styles them)
+local tabBtns = {}
+local tabStrokes = {}
+local TAB_NAMES = { "Private", "Normal" }
+local tabBar = Instance.new("Frame")
+tabBar.Name = "Tabs"
+tabBar.Size = UDim2.new(1, -12, 1, -12)
+tabBar.Position = UDim2.new(0, 6, 0, 6)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = header
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 4)
+tabLayout.Parent = tabBar
+for i, tn in ipairs(TAB_NAMES) do
+    local b = Instance.new("TextButton")
+    b.Name = tn .. "Tab"
+    b.Size = UDim2.new(1 / #TAB_NAMES, -2, 1, 0)
+    b.BackgroundColor3 = ACCENT
+    b.BackgroundTransparency = 1
+    b.BorderSizePixel = 0
+    b.Text = tn
+    b.TextColor3 = TEXT_DIM
+    b.TextSize = 12
+    b.Font = Enum.Font.Gotham
+    b.LayoutOrder = i
+    b.AutoButtonColor = true
+    b.Parent = tabBar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    local tbStroke = Instance.new("UIStroke")
+    tbStroke.Color = Color3.fromRGB(120, 190, 255)
+    tbStroke.Transparency = 1
+    tbStroke.Thickness = 1
+    tbStroke.Parent = b
+    tabBtns[tn] = b
+    tabStrokes[tn] = tbStroke
+end
+
+local msgs = Instance.new("ScrollingFrame")
+msgs.Name = "Messages"
+msgs.Size = UDim2.new(1, -14, 1, -104)
+msgs.Position = UDim2.new(0, 7, 0, 52)
+msgs.BackgroundTransparency = 1
+msgs.BorderSizePixel = 0
+msgs.ScrollBarThickness = 3
+msgs.ScrollBarImageColor3 = Color3.fromRGB(130, 130, 150)
+msgs.ScrollBarImageTransparency = 0.3
+msgs.ClipsDescendants = true
+msgs.CanvasSize = UDim2.new(0, 0, 0, 0)
+msgs.AutomaticCanvasSize = Enum.AutomaticSize.Y
+msgs.Parent = main
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 5)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = msgs
+local msgPad = Instance.new("UIPadding")
+msgPad.PaddingRight = UDim.new(0, 4)
+msgPad.Parent = msgs
+
+local renderFeed
+local activeTab = "Private"
+local togglePanel
+local lastChipTap = -1
+local function chipTap(source)
+    if not generationCurrent() then return end
+    local now = os.clock()
+    if now - lastChipTap < 0.4 then return end
+    lastChipTap = now
+    if togglePanel then
+        togglePanel(source)
+    else
+        main.Visible = not main.Visible
+        LOG("ui", "%s tapped -> panel visible=%s", tostring(source), tostring(main.Visible))
+    end
+end
+local function scrollMsgsBottom()
+    task.defer(function()
+        pcall(function()
+            msgs.CanvasPosition = Vector2.new(0, math.max(0, msgs.AbsoluteCanvasSize.Y - msgs.AbsoluteWindowSize.Y))
+        end)
+    end)
+end
+
+local inputBar = Instance.new("Frame")
+inputBar.Name = "InputBar"
+inputBar.Size = UDim2.new(1, -14, 0, 40)
+inputBar.Position = UDim2.new(0, 7, 1, -47)
+inputBar.BackgroundColor3 = PANEL
+inputBar.BackgroundTransparency = 0.5
+inputBar.BorderSizePixel = 0
+inputBar.Parent = main
+Instance.new("UICorner", inputBar).CornerRadius = UDim.new(0, 10)
+local inputStroke = Instance.new("UIStroke")
+inputStroke.Color = Color3.fromRGB(255, 255, 255)
+inputStroke.Transparency = 0.9
+inputStroke.Thickness = 1
+inputStroke.Parent = inputBar
+
+local divider = Instance.new("Frame")
+divider.Name = "Divider"
+divider.Size = UDim2.new(1, -20, 0, 1)
+divider.Position = UDim2.new(0, 10, 1, -50)
+divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+divider.BackgroundTransparency = 0.9
+divider.BorderSizePixel = 0
+divider.Parent = main
+
+local box = Instance.new("TextBox")
+box.Size = UDim2.new(1, -60, 1, -8)
+box.Position = UDim2.new(0, 10, 0, 4)
+box.BackgroundTransparency = 1
+box.Text = ""
+box.PlaceholderText = "Message..."
+box.PlaceholderColor3 = Color3.fromRGB(150, 150, 168)
+box.TextColor3 = TEXT_MAIN
+box.TextSize = 13
+box.Font = Enum.Font.Gotham
+box.TextXAlignment = Enum.TextXAlignment.Left
+box.TextYAlignment = Enum.TextYAlignment.Center
+box.ClearTextOnFocus = false
+box.Parent = inputBar
+
+local sendBtn = Instance.new("TextButton")
+sendBtn.Size = UDim2.new(0, 32, 0, 32)
+sendBtn.Position = UDim2.new(1, -40, 0.5, -16)
+sendBtn.BackgroundColor3 = ACCENT
+sendBtn.BorderSizePixel = 0
+sendBtn.Text = ">"
+sendBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+sendBtn.TextSize = 16
+sendBtn.Font = Enum.Font.GothamBold
+sendBtn.AutoButtonColor = true
+sendBtn.Parent = inputBar
+Instance.new("UICorner", sendBtn).CornerRadius = UDim.new(1, 0)
+
+-- ================= chat pill ICON (self-contained, no local/cloud path) =================
+-- The PNG is embedded as base64, decoded at run time, written to the executor
+-- workspace once, then turned into a local asset via getcustomasset/getsynasset.
+local ICON_B64 = [[
+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
+]]
+local chatIconImage = nil
+do
+    local function b64decode(s)
+        local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        local map = {}
+        for i = 1, #chars do map[chars:sub(i, i)] = i - 1 end
+        s = s:gsub("%s+", "")
+        local out = {}
+        for i = 1, #s, 4 do
+            local c1, c2 = s:sub(i, i), s:sub(i + 1, i + 1)
+            local c3, c4 = s:sub(i + 2, i + 2), s:sub(i + 3, i + 3)
+            local v1, v2 = map[c1] or 0, map[c2] or 0
+            local v3 = c3 ~= "=" and (map[c3] or 0) or nil
+            local v4 = c4 ~= "=" and (map[c4] or 0) or nil
+            local v = v1 * 262144 + v2 * 4096 + (v3 or 0) * 64 + (v4 or 0)
+            out[#out + 1] = string.char(math.floor(v / 65536) % 256)
+            if v3 then out[#out + 1] = string.char(math.floor(v / 256) % 256) end
+            if v4 then out[#out + 1] = string.char(v % 256) end
+        end
+        return table.concat(out)
+    end
+    local ok, res = pcall(function()
+        local bytes = b64decode(ICON_B64)
+        local name = "vez_chat_icon.png"
+        local old = nil
+        if type(isfile) == "function" and isfile(name) and type(readfile) == "function" then
+            old = readfile(name)
+        end
+        if type(writefile) == "function" and old ~= bytes then writefile(name, bytes) end
+        if type(getcustomasset) == "function" then return getcustomasset(name) end
+        if type(getsynasset) == "function" then return getsynasset(name) end
+        error("getcustomasset/getsynasset unavailable")
+    end)
+    local valid = ok and type(res) == "string"
+        and (res:match("^rbxasset") ~= nil or res:match("^https?://") ~= nil or res:match("^file://") ~= nil)
+    if valid then
+        chatIconImage = res
+        LOG("ui", "chat icon asset ready (%d b64 chars)", #ICON_B64)
+    else
+        LOG("ui", "chat icon failed (%s); keeping CHAT text", tostring(res))
+    end
+end
+
+-- floating CHAT button: 42px rounded chip (smaller icon) + MOVABLE (drag, tap toggles panel)
+local floatBtn = Instance.new("TextButton")
+floatBtn.Name = "Chat pill"
+floatBtn.Size = UDim2.new(0, FLOAT_SIZE, 0, FLOAT_SIZE)
+floatBtn.Position = UDim2.new(1, -(FLOAT_SIZE + 10), 1, -140)
+floatBtn.BackgroundColor3 = ICON_BG
+floatBtn.Text = "CHAT"
+floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+floatBtn.TextSize = 7
+floatBtn.TextScaled = true
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.AutoButtonColor = true
+floatBtn.Active = true
+floatBtn.Visible = true
+floatBtn.Parent = gui
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 18)
+local floatPad = Instance.new("UIPadding")
+floatPad.PaddingLeft = UDim.new(0, 2)
+floatPad.PaddingRight = UDim.new(0, 2)
+floatPad.PaddingTop = UDim.new(0, 2)
+floatPad.PaddingBottom = UDim.new(0, 2)
+floatPad.Parent = floatBtn
+local floatStroke = Instance.new("UIStroke")
+floatStroke.Color = Color3.fromRGB(255, 255, 255)
+floatStroke.Transparency = 0.75
+floatStroke.Thickness = 1
+floatStroke.Parent = floatBtn
+
+local unreadBadge = nil
+if chatIconImage then
+    floatBtn.Text = ""
+    floatBtn.BackgroundTransparency = 0
+    local chatIcon = Instance.new("ImageLabel")
+    chatIcon.Name = "Icon"
+    chatIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+    chatIcon.Size = UDim2.fromScale(0.848, 0.848)
+    chatIcon.Position = UDim2.fromScale(0.5, 0.5)
+    chatIcon.BackgroundTransparency = 1
+    chatIcon.Image = chatIconImage
+    chatIcon.ScaleType = Enum.ScaleType.Fit
+    chatIcon.Active = false
+    chatIcon.ZIndex = 2
+    chatIcon.Parent = floatBtn
+
+    unreadBadge = Instance.new("TextLabel")
+    unreadBadge.Name = "Unread"
+    unreadBadge.AnchorPoint = Vector2.new(1, 0)
+    unreadBadge.Position = UDim2.new(1, 0, 0, 0)
+    unreadBadge.Size = UDim2.new(0, 12, 0, 12)
+    unreadBadge.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+    unreadBadge.BorderSizePixel = 0
+    unreadBadge.Text = ""
+    unreadBadge.TextColor3 = Color3.fromRGB(255, 255, 255)
+    unreadBadge.Font = Enum.Font.GothamBold
+    unreadBadge.TextScaled = true
+    unreadBadge.Visible = false
+    unreadBadge.ZIndex = 3
+    unreadBadge.Parent = floatBtn
+    Instance.new("UICorner", unreadBadge).CornerRadius = UDim.new(1, 0)
+
+    -- if the local asset never actually renders, restore a visible CHAT pill
+    task.delay(3, function()
+        local loaded = false
+        pcall(function() loaded = chatIcon.IsLoaded == true end)
+        if not loaded and chatIcon.Parent then
+            LOG("ui", "icon never loaded; switching pill back to CHAT text")
+            chatIcon:Destroy()
+            floatBtn.Text = "CHAT"
+            floatBtn.BackgroundColor3 = ICON_BG
+            floatBtn.BackgroundTransparency = 0
+        end
+    end)
+end
+LOG("ui", "floatBtn created size=%d (chip, movable, icon=%s)", FLOAT_SIZE, tostring(chatIconImage ~= nil))
+
+local unread = 0
+local topbarBadge = nil
+local function badgeAlive(badge)
+    if not badge then return false end
+    local ok, parent = pcall(function() return badge.Parent end)
+    return ok and parent ~= nil
+end
+local function refreshFloat()
+    pcall(function()
+        local countText = unread > 99 and "99+" or tostring(unread)
+        if unreadBadge and not badgeAlive(unreadBadge) then unreadBadge = nil end
+        if topbarBadge and not badgeAlive(topbarBadge) then topbarBadge = nil end
+        local floatHasBadge = unreadBadge ~= nil
+        if unreadBadge then
+            unreadBadge.Text = countText
+            unreadBadge.Visible = unread > 0
+        end
+        if topbarBadge then
+            topbarBadge.Text = countText
+            topbarBadge.Visible = unread > 0
+        end
+        if not floatHasBadge then
+            if unread > 0 then
+                floatBtn.Text = countText
+                floatBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+            else
+                floatBtn.Text = "CHAT"
+                floatBtn.BackgroundColor3 = ICON_BG
+            end
+        end
+    end)
+end
+
+-- ================= topbar slot overlay =================
+-- The built-in chat button is kept (see hideDefaultChat) purely as the layout
+-- host for our chip. We hide its artwork rather than the button itself so the
+-- topbar keeps reserving the same space.
+local topbarChip, topbarHost = nil, nil
+
+local function getCoreGui()
+    local cg = nil
+    pcall(function() cg = game:GetService("CoreGui") end)
+    if not cg then pcall(function() cg = game.CoreGui end) end
+    return cg
+end
+
+local function isUnder(o, root)
+    local node = o
+    for _ = 1, 12 do
+        if node == nil then return false end
+        if node == root then return true end
+        local ok, p = pcall(function() return node.Parent end)
+        if not ok then return false end
+        node = p
+    end
+    return false
+end
+
+local function objectImage(o)
+    local ok, img = pcall(function() return o.Image end)
+    if ok and type(img) == "string" then return img end
+    return ""
+end
+
+-- Never treat a hidden "Chat" entry in the avatar/settings dropdown as the
+-- topbar chat slot.  Walking up from such an entry used to land on the
+-- player's headshot button, which put our 42px chip over the avatar.
+local TOPBAR_BAD = {
+    "headshot", "avatar", "profile", "playerlist", "leaderboard",
+    "friends", "party", "platform", "settings", "emote",
+    "backpack", "inventory", "shop", "robux", "notification",
+    "hamburger", "home", "voice", "microphone", "leave", "report",
+    "dropdown", "contextmenu", "popup",
+}
+local function topbarHostBad(full)
+    full = tostring(full or ""):lower()
+    for _, token in ipairs(TOPBAR_BAD) do
+        if full:find(token, 1, true) then return token end
+    end
+    return nil
+end
+
+local function scoreChatCandidate(o)
+    local score = 0
+    local name = ""
+    pcall(function() name = o.Name end)
+    name = tostring(name):lower()
+    if name == "vezchattopbar" then return -100 end
+    if name:find("chat", 1, true) then
+        if name == "chat" or name == "chaticon" or name == "chatbutton" then
+            score = score + 60
+        else
+            score = score + 30
+        end
+    end
+    local img = objectImage(o):lower()
+    if img:find("chat", 1, true) then score = score + 25 end
+    local full = ""
+    pcall(function() full = o:GetFullName():lower() end)
+    if topbarHostBad(full) then score = score - 100 end
+    if full:find("topbarapp", 1, true) then score = score + 3 end
+    if full:find("leftframe", 1, true) then score = score + 5 end
+    if full:find("friends", 1, true) or full:find("party", 1, true)
+        or full:find("platform", 1, true) then
+        score = score - 60
+    end
+    -- never mistake the (hidden) default chat window/input for the topbar button
+    if full:find("chatwindow", 1, true) or full:find("chatinput", 1, true)
+        or full:find("chatframe", 1, true) or full:find("chatbar", 1, true) then
+        score = score - 80
+    end
+    return score
+end
+
+local function buttonFor(o, stopAt)
+    local node = o
+    for _ = 1, 6 do
+        if node == nil or node == stopAt then break end
+        local ok, isBtn = pcall(function() return node:IsA("GuiButton") end)
+        if ok and isBtn then return node end
+        local okp, p = pcall(function() return node.Parent end)
+        if not okp then break end
+        node = p
+    end
+    return o
+end
+
+local function visibleChain(o)
+    local node = o
+    for _ = 1, 12 do
+        if node == nil then break end
+        local ok, vis = pcall(function() return node.Visible end)
+        if ok and vis == false then return false end
+        local oken, en = pcall(function() return node.Enabled end)
+        if oken and en == false then return false end
+        local okp, p = pcall(function() return node.Parent end)
+        if not okp then break end
+        node = p
+    end
+    return true
+end
+
+local function hostHasChatArt(host)
+    local name = ""
+    pcall(function() name = tostring(host.Name):lower() end)
+    if name:find("chat", 1, true) then return true end
+    if objectImage(host):lower():find("chat", 1, true) then return true end
+    local ok, list = pcall(function() return host:GetDescendants() end)
+    if ok and list then
+        for _, d in ipairs(list) do
+            local dn = ""
+            pcall(function() dn = tostring(d.Name):lower() end)
+            if (dn:find("chat", 1, true)
+                or objectImage(d):lower():find("chat", 1, true))
+                and visibleChain(d) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function topbarHostValid(host)
+    if not host then return false end
+    local okp, parent = pcall(function() return host.Parent end)
+    if not okp or not parent then return false end
+    local okGui, isGui = pcall(function() return host:IsA("GuiObject") end)
+    if not okGui or not isGui then return false end
+    local full, name = "", ""
+    pcall(function() full = host:GetFullName() end)
+    pcall(function() name = host.Name end)
+    full = tostring(full):lower()
+    name = tostring(name):lower()
+    if full:find("vezchattopbar", 1, true) then return false end
+    if topbarHostBad(full) then return false end
+    -- The legacy ChatIcon path is authoritative.  Accept it even if a client
+    -- renamed an ancestor or reports an unexpected AbsoluteSize.
+    if full:find("chaticon", 1, true) then return true end
+    if not (full:find("topbar", 1, true) or full:find("unibar", 1, true)
+        or full:find("chrome", 1, true) or full:find("leftframe", 1, true)
+        or full:find("experience", 1, true) or full:find("hud", 1, true)) then
+        return false
+    end
+    if not hostHasChatArt(host) then return false end
+    local sx, sy = 0, 0
+    pcall(function()
+        local s = host.AbsoluteSize
+        if s then sx, sy = s.X, s.Y end
+    end)
+    -- A topbar icon is small.  A large container with a chat descendant is
+    -- not the slot; attaching there centers the chip over other topbar UI.
+    if (sx > 96 or sy > 96) and name ~= "chat" and name ~= "chaticon"
+        and name ~= "chatbutton" then
+        return false
+    end
+    return true
+end
+
+local function scanChatHost(root, threshold, requireTopbarAncestry)
+    local best, bestScore = nil, threshold
+    local ok, list = pcall(function() return root:GetDescendants() end)
+    if not ok or not list then return nil end
+    for _, o in ipairs(list) do
+        local okGui, isGui = pcall(function() return o:IsA("GuiObject") end)
+        if okGui and isGui then
+            local full = ""
+            pcall(function() full = o:GetFullName():lower() end)
+            local topbarish = full:find("topbar", 1, true) or full:find("unibar", 1, true)
+                or full:find("chrome", 1, true) or full:find("experience", 1, true)
+                or full:find("leftframe", 1, true) or full:find("hud", 1, true)
+            if topbarish or not requireTopbarAncestry then
+                local s = scoreChatCandidate(o)
+                -- Hidden dropdown entries are not the topbar slot.
+                if s > 20 and visibleChain(o) then
+                    s = s + 40
+                    if s > bestScore then best, bestScore = o, s end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local lastTopbarReject = nil
+local function noteTopbarReject(host)
+    local full = "?"
+    pcall(function() full = host:GetFullName() end)
+    full = tostring(full)
+    if full == lastTopbarReject then return end
+    lastTopbarReject = full
+    LOG("ui", "topbar host rejected: %s", full)
+end
+
+local function findTopbarChatHost()
+    local cg = getCoreGui()
+    if not cg then return nil end
+    local top = nil
+    pcall(function() top = cg:FindFirstChild("TopBarApp") end)
+    if top then
+        local legacy = nil
+        pcall(function()
+            local tf = top:FindFirstChild("TopBarFrame")
+            local lf = tf and tf:FindFirstChild("LeftFrame")
+            legacy = lf and lf:FindFirstChild("ChatIcon")
+        end)
+        if legacy and legacy:IsA("GuiObject") then
+            local cand = buttonFor(legacy, cg)
+            if visibleChain(cand) then
+                if topbarHostValid(cand) then return cand end
+                noteTopbarReject(cand)
+            end
+        end
+    end
+    local best = top and scanChatHost(top, 20, false) or nil
+    if not best then
+        -- Some clients do not keep chat inside TopBarApp. Scan CoreGui too,
+        -- but only under topbar/unibar/chrome-like ancestors so the hidden
+        -- default chat window cannot be mistaken for the icon.
+        best = scanChatHost(cg, 20, true)
+    end
+    if not best then return nil end
+    local host = buttonFor(best, cg)
+    if visibleChain(host) and topbarHostValid(host) then return host end
+    if visibleChain(best) and topbarHostValid(best) then return best end
+    noteTopbarReject(host or best)
+    return nil
+end
+
+local function hideTopbarArt(host, chip)
+    local function hideOne(o)
+        if o == nil or o == chip then return end
+        if isUnder(o, chip) then return end
+        -- never hide another VEZ chip; a stale copy may still be present
+        if o.Name == "VEZChatTopbar" then return end
+        pcall(function()
+            if o:IsA("ImageLabel") or o:IsA("ImageButton") then o.ImageTransparency = 1 end
+            if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then o.TextTransparency = 1 end
+            if o:IsA("Frame") or o:IsA("ScrollingFrame") or o:IsA("ViewportFrame") then
+                o.BackgroundTransparency = 1
+            end
+            if o:IsA("UIStroke") then o.Transparency = 1 end
+            -- our chip is the only click target; stop the built-in button and
+            -- any invisible touch frame from intercepting taps on the slot
+            if o:IsA("GuiButton") then
+                pcall(function() o.Interactable = false end)
+            end
+            if o:IsA("GuiObject") then
+                pcall(function() o.Active = false end)
+                pcall(function() o.Selectable = false end)
+            end
+        end)
+    end
+    hideOne(host)
+    local ok, list = pcall(function() return host:GetDescendants() end)
+    if ok and list then
+        for _, d in ipairs(list) do hideOne(d) end
+    end
+end
+
+local function syncTopbarChipSize()
+    if not (topbarChip and topbarHost) then return end
+    local size = FLOAT_SIZE
+    local ok, hs = pcall(function() return topbarHost.AbsoluteSize end)
+    if ok and hs and hs.X and hs.Y then
+        local m = math.min(FLOAT_SIZE, hs.X, hs.Y)
+        if m >= 24 then size = math.floor(m + 0.5) end
+    end
+    local current = -1
+    pcall(function() current = topbarChip.Size.X.Offset end)
+    if current == size then return end
+    topbarChip.Size = UDim2.fromOffset(size, size)
+    local corner = topbarChip:FindFirstChildOfClass("UICorner")
+    if corner then corner.CornerRadius = UDim.new(0, math.floor(size * 0.43)) end
+end
+
+-- A stale copy of this script can hide/re-disable our chip every couple of
+-- seconds.  Re-assert our own visual/input state so the current copy stays usable.
+local function restoreTopbarChip()
+    local chip = topbarChip
+    if not chip then return end
+    pcall(function()
+        chip.Visible = true
+        chip.Active = true
+        chip.Selectable = true
+        chip.BackgroundTransparency = 0
+        chip.TextTransparency = 0
+        if chip:IsA("GuiButton") then chip.Interactable = true end
+        local icon = chip:FindFirstChild("Icon")
+        if icon then icon.ImageTransparency = 0 end
+        local stroke = chip:FindFirstChildOfClass("UIStroke")
+        if stroke then stroke.Transparency = 0.75 end
+        local badge = chip:FindFirstChild("Unread")
+        if badge then badge.TextTransparency = 0 end
+    end)
+end
+
+local function buildTopbarChip()
+    local chip = Instance.new("TextButton")
+    chip.Name = "VEZChatTopbar"
+    chip.AnchorPoint = Vector2.new(0.5, 0.5)
+    chip.Position = UDim2.new(0.5, 0, 0.5, 0)
+    chip.Size = UDim2.fromOffset(FLOAT_SIZE, FLOAT_SIZE)
+    chip.BackgroundColor3 = ICON_BG
+    chip.BackgroundTransparency = 0
+    chip.BorderSizePixel = 0
+    chip.Text = chatIconImage and "" or "CHAT"
+    chip.TextColor3 = Color3.fromRGB(255, 255, 255)
+    chip.TextSize = 7
+    chip.TextScaled = true
+    chip.Font = Enum.Font.GothamBold
+    chip.AutoButtonColor = true
+    chip.Active = true
+    chip.Visible = true
+    chip.ZIndex = 1000
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 18)
+    corner.Parent = chip
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.75
+    stroke.Thickness = 1
+    stroke.Parent = chip
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0, 2)
+    pad.PaddingRight = UDim.new(0, 2)
+    pad.PaddingTop = UDim.new(0, 2)
+    pad.PaddingBottom = UDim.new(0, 2)
+    pad.Parent = chip
+    if chatIconImage then
+        local icon = Instance.new("ImageLabel")
+        icon.Name = "Icon"
+        icon.AnchorPoint = Vector2.new(0.5, 0.5)
+        icon.Size = UDim2.fromScale(0.848, 0.848)
+        icon.Position = UDim2.fromScale(0.5, 0.5)
+        icon.BackgroundTransparency = 1
+        icon.Image = chatIconImage
+        icon.ScaleType = Enum.ScaleType.Fit
+        icon.Active = false
+        icon.ZIndex = 1001
+        icon.Parent = chip
+        task.delay(3, function()
+            local loaded = false
+            pcall(function() loaded = icon.IsLoaded == true end)
+            if not loaded and icon.Parent then
+                icon:Destroy()
+                if chip.Parent then
+                    chip.Text = "CHAT"
+                    chip.BackgroundColor3 = ICON_BG
+                end
+            end
+        end)
+    end
+    local badge = topbarBadge
+    if not badge then
+        badge = Instance.new("TextLabel")
+        badge.Name = "Unread"
+        badge.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+        badge.BorderSizePixel = 0
+        badge.Text = ""
+        badge.TextColor3 = Color3.fromRGB(255, 255, 255)
+        badge.Font = Enum.Font.GothamBold
+        badge.TextScaled = true
+        badge.Visible = false
+        topbarBadge = badge
+        Instance.new("UICorner", badge).CornerRadius = UDim.new(1, 0)
+    end
+    badge.AnchorPoint = Vector2.new(1, 0)
+    badge.Position = UDim2.new(1, 0, 0, 0)
+    badge.Size = UDim2.new(0, 12, 0, 12)
+    badge.ZIndex = 1002
+    badge.Parent = chip
+    chip.MouseButton1Click:Connect(function()
+        chipTap("topbar")
+    end)
+    return chip
+end
+
+local function topbarAttached()
+    if not (topbarChip and topbarHost) then return false end
+    local ok1, cp = pcall(function() return topbarChip.Parent end)
+    if not ok1 or cp ~= topbarHost then return false end
+    local ok2, hp = pcall(function() return topbarHost.Parent end)
+    if not ok2 or hp == nil then return false end
+    return topbarHostValid(topbarHost)
+end
+
+local function detachTopbarChip()
+    if topbarBadge then
+        pcall(function() topbarBadge:Destroy() end)
+        topbarBadge = nil
+    end
+    if topbarChip then pcall(function() topbarChip:Destroy() end) end
+    topbarChip, topbarHost = nil, nil
+    floatBtn.Visible = true
+    refreshFloat()
+end
+
+local function attachTopbarChip()
+    if topbarChip and topbarHost then
+        if topbarAttached() then
+            syncTopbarChipSize()
+            return true
+        end
+        detachTopbarChip()
+    end
+    local host = findTopbarChatHost()
+    if not host or not topbarHostValid(host) then return false end
+    local ok, err = pcall(function()
+        local chip = buildTopbarChip()
+        topbarChip, topbarHost = chip, host
+        chip.Parent = host
+        hideTopbarArt(host, chip)
+        syncTopbarChipSize()
+    end)
+    if not ok then
+        LOG("ui", "topbar chip attach failed: %s", tostring(err))
+        detachTopbarChip()
+        return false
+    end
+    task.defer(function() syncTopbarChipSize() end)
+    floatBtn.Visible = not visibleChain(topbarHost)
+    local full = "?"
+    pcall(function() full = topbarHost:GetFullName() end)
+    LOG("ui", "topbar chip attached to %s (pill visible=%s)",
+        tostring(full), tostring(floatBtn.Visible))
+    refreshFloat()
+    return true
+end
+
+do
+    if attachTopbarChip() then
+        LOG("ui", "floating pill hidden (topbar slot active)")
+    else
+        LOG("ui", "topbar chat slot not found yet; floating pill active")
+    end
+end
+task.spawn(function()
+    local misses = 0
+    while generationCurrent() do
+        task.wait(2)
+        if not generationCurrent() then break end
+        if topbarAttached() then
+            misses = 0
+            syncTopbarChipSize()
+            -- remove stale copies of the chip left by an older execution
+            local okList, list = pcall(function() return topbarHost:GetDescendants() end)
+            if okList and list then
+                for _, d in ipairs(list) do
+                    if d.Name == "VEZChatTopbar" and d ~= topbarChip then
+                        pcall(function() d:Destroy() end)
+                    end
+                end
+            end
+            -- built-in chat may repaint its icon/badge; keep its art hidden
+            hideTopbarArt(topbarHost, topbarChip)
+            restoreTopbarChip()
+            pcall(function() if topbarHost.ZIndex ~= 1000 then topbarHost.ZIndex = 1000 end end)
+            pcall(function() if topbarChip.ZIndex ~= 1000 then topbarChip.ZIndex = 1000 end end)
+            -- if the topbar itself is hidden, keep the floating pill as fallback
+            local showPill = not visibleChain(topbarHost)
+            pcall(function() if floatBtn.Visible ~= showPill then floatBtn.Visible = showPill end end)
+        else
+            if topbarChip or topbarHost then
+                LOG("ui", "topbar chip lost; falling back to floating pill")
+                detachTopbarChip()
+            end
+            pcall(function() floatBtn.Visible = true end)
+            misses = misses + 1
+            if misses <= 30 then
+                if attachTopbarChip() then
+                    misses = 0
+                    LOG("ui", "floating pill hidden (topbar slot active)")
+                elseif misses == 30 then
+                    LOG("ui", "topbar chat slot unavailable after retries; keeping floating pill, retrying slowly")
+                end
+            elseif misses % 5 == 0 then
+                if attachTopbarChip() then
+                    misses = 0
+                    LOG("ui", "floating pill hidden (topbar slot active)")
+                end
+            end
+        end
+    end
+end)
+
+local function topbarTapArea(input)
+    if not generationCurrent() then return end
+    local t = input.UserInputType
+    if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+    local chip = topbarChip
+    if not chip then return end
+    if not topbarAttached() then return end
+    -- Do not require the full visible chain here: this is the fallback for a
+    -- chip that the game/old copy made transparent or non-interactable.
+    local okVis, vis = pcall(function()
+        return chip.Visible ~= false and (not topbarHost or topbarHost.Visible ~= false)
+    end)
+    if not okVis or not vis then return end
+    local ap, sz
+    pcall(function()
+        ap = chip.AbsolutePosition
+        sz = chip.AbsoluteSize
+    end)
+    local pos = input.Position
+    if not ap or not sz or not pos then return end
+    local insetY = 0
+    pcall(function() insetY = game:GetService("GuiService"):GetGuiInset().Y end)
+    local px, py = pos.X, pos.Y
+    local function inside(x, y)
+        return x >= ap.X - 6 and x <= ap.X + sz.X + 6
+            and y >= ap.Y - 6 and y <= ap.Y + sz.Y + 6
+    end
+    if inside(px, py) or inside(px, py - insetY) then
+        LOG("ui", "topbar area tapped (input fallback)")
+        chipTap("topbar-area")
+    end
+end
+UIS.InputBegan:Connect(topbarTapArea)
+
+-- viewport helper: read camera FRESH every call (old code cached it once -> bad clamp after rotation/resize)
+local function viewport()
+    local cam = nil
+    pcall(function() cam = workspace.CurrentCamera end)
+    if cam then return cam.ViewportSize end
+    return Vector2.new(800, 600)
+end
+
+-- ================= movable PANEL (drag header, mouse + touch) =================
+local function panelAbs()
+    local vs = viewport()
+    local p = main.Position
+    return p.X.Scale * vs.X + p.X.Offset, p.Y.Scale * vs.Y + p.Y.Offset
+end
+local function clampPanelPos(ax, ay)
+    local vs = viewport()
+    local w, h = main.AbsoluteSize.X, main.AbsoluteSize.Y
+    if w <= 0 then w = MIN_W end
+    if h <= 0 then h = MIN_H end
+    return UDim2.new(0, math.clamp(ax, 0, math.max(0, vs.X - w)),
+        0, math.clamp(ay, 0, math.max(0, vs.Y - h)))
+end
+do
+    local ax, ay = panelAbs()
+    main.Position = clampPanelPos(ax, ay)
+end
+local function panelOnScreen()
+    local ax, ay = panelAbs()
+    local vs = viewport()
+    local w, h = main.AbsoluteSize.X, main.AbsoluteSize.Y
+    if w <= 0 then w = MIN_W end
+    if h <= 0 then h = MIN_H end
+    return ax + w > 0 and ay + h > 0 and ax < vs.X and ay < vs.Y
+end
+
+local panelParentFailures = 0
+local function ensurePanelParented()
+    local okp, parent = pcall(function() return gui.Parent end)
+    if okp and parent then
+        panelParentFailures = 0
+        return true, false
+    end
+    local np, how = resolveParent()
+    if typeof(np) == "Instance" then
+        local ok = pcall(function() gui.Parent = np end)
+        if ok then
+            LOG("ui", "panel GUI re-parented to %s (%s)", np:GetFullName(), how)
+            panelParentFailures = 0
+            return true, true
+        end
+    end
+    panelParentFailures = panelParentFailures + 1
+    LOG("ui", "panel GUI is unavailable and could not be re-parented")
+    if panelParentFailures >= 3 then
+        panelParentFailures = 0
+        task.spawn(function() reloadSelf("panel GUI unavailable") end)
+    end
+    return false, false
+end
+
+togglePanel = function(source)
+    if not generationCurrent() then return end
+    local parented, reparented = ensurePanelParented()
+    if not parented then return end
+    local wasEnabled = true
+    pcall(function() wasEnabled = gui.Enabled ~= false end)
+    pcall(function() gui.Enabled = true end)
+    pcall(function() gui.DisplayOrder = 999999 end)
+    -- The frame can be unparented independently of the ScreenGui.
+    local mainReparented = false
+    local okMain, mainErr = pcall(function()
+        if main.Parent ~= gui then
+            main.Parent = gui
+            mainReparented = true
+        end
+    end)
+    if not okMain then
+        LOG("ui", "panel frame unavailable: %s", tostring(mainErr))
+        task.spawn(function() reloadSelf("panel frame unavailable") end)
+        return
+    end
+    local wasVisible, onScreen = false, false
+    pcall(function() wasVisible = main.Visible == true end)
+    pcall(function() onScreen = panelOnScreen() end)
+    -- If the GUI was disabled, the panel was not actually visible even though
+    -- main.Visible was still true.  The first tap must open it, not hide it.
+    if wasVisible and wasEnabled and not reparented and not mainReparented and onScreen then
+        pcall(function() main.Visible = false end)
+        LOG("ui", "%s tapped -> panel hidden", tostring(source))
+        return
+    end
+    pcall(function() main.Position = clampPanelPos(panelAbs()) end)
+    local okShow = pcall(function() main.Visible = true end)
+    if not okShow then
+        LOG("ui", "panel frame could not be shown")
+        task.spawn(function() reloadSelf("panel frame could not be shown") end)
+        return
+    end
+    unread = 0
+    pcall(refreshFloat)
+    if renderFeed then
+        local ok, err = pcall(renderFeed, activeTab)
+        if not ok then LOG("ui", "renderFeed failed on open: %s", tostring(err)) end
+    end
+    scrollMsgsBottom()
+    LOG("ui", "%s tapped -> panel shown", tostring(source))
+end
+
+task.spawn(function()
+    while generationCurrent() do
+        task.wait(2)
+        if not generationCurrent() then break end
+        local visible = false
+        pcall(function() visible = main.Visible == true end)
+        if visible then
+            pcall(function() main.Position = clampPanelPos(panelAbs()) end)
+        end
+    end
+end)
+do
+    local dragging, lastPos = false, nil
+    -- grabs land on the tab buttons (they cover the header), so drag from them too
+    local function beginDrag(input)
+        if not generationCurrent() then return end
+        if dragging then return end
+        if locked then LOG("drag", "panel drag blocked (locked)") return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            dragging, lastPos = true, input.Position
+            LOG("drag", "panel drag start")
+        end
+    end
+    header.InputBegan:Connect(beginDrag)
+    for _, tb in pairs(tabBtns) do
+        tb.InputBegan:Connect(beginDrag)
+    end
+    UIS.InputChanged:Connect(function(input)
+        if not generationCurrent() then return end
+        local st = input.UserInputState
+        if st == Enum.UserInputState.End or st == Enum.UserInputState.Cancel then
+            if dragging then dragging = false LOG("drag", "panel drag end (cancel)") end
+            return
+        end
+        if not dragging then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+            local d = input.Position - lastPos
+            lastPos = input.Position
+            pcall(function()
+                local ax, ay = panelAbs()
+                main.Position = clampPanelPos(ax + d.X, ay + d.Y)
+            end)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if not generationCurrent() then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            if dragging then dragging = false LOG("drag", "panel drag end") end
+        end
+    end)
+end
+
+-- ================= movable FLOAT BUTTON (drag anywhere, tap toggles) =================
+-- Tap vs drag: moved <=10px on release = tap (toggle panel). Moved more = drag (stay, no toggle).
+local function floatAbs()
+    local vs = viewport()
+    local p = floatBtn.Position
+    return p.X.Scale * vs.X + p.X.Offset, p.Y.Scale * vs.Y + p.Y.Offset
+end
+local function clampFloatPos(ax, ay)
+    local vs = viewport()
+    local s = floatBtn.AbsoluteSize
+    local w = (s.X > 0) and s.X or FLOAT_SIZE
+    local h = (s.Y > 0) and s.Y or FLOAT_SIZE
+    return UDim2.new(0, math.clamp(ax, 0, math.max(0, vs.X - w)),
+        0, math.clamp(ay, 0, math.max(0, vs.Y - h)))
+end
+task.spawn(function()
+    while generationCurrent() do
+        task.wait(2)
+        if not generationCurrent() then break end
+        pcall(function()
+            if floatBtn.Parent ~= gui then floatBtn.Parent = gui end
+        end)
+        local visible = false
+        pcall(function() visible = floatBtn.Visible == true end)
+        if visible then
+            pcall(function()
+                local ax, ay = floatAbs()
+                floatBtn.Position = clampFloatPos(ax, ay)
+            end)
+        end
+    end
+end)
+-- ================= persist locked UI positions across re-executes =================
+-- /lock stores pill + panel positions and the lock flag (tiny comment markers
+-- appended to this script + a sidecar file); on boot they are restored and clamped.
+local function parsePillPos(s)
+    if type(s) ~= "string" then return nil end
+    local sx, sy, ox, oy = s:match("^([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)$")
+    if not sx then return nil end
+    local n1, n2, n3, n4 = tonumber(sx), tonumber(sy), tonumber(ox), tonumber(oy)
+    if not (n1 and n2 and n3 and n4) then return nil end
+    if n1 < 0 or n1 > 1 or n2 < 0 or n2 > 1 then return nil end
+    return UDim2.new(n1, n3, n2, n4)
+end
+
+-- saved payload: pill4 [| panel4]; older saves contain only the pill4 part
+local function parseSavedPos(s)
+    if type(s) ~= "string" then return nil end
+    local p = {}
+    for piece in s:gmatch("[^|]+") do p[#p + 1] = piece end
+    if #p == 4 then
+        local pill = parsePillPos(s)
+        if pill then return { pill = pill } end
+    elseif #p == 8 then
+        local pill = parsePillPos(table.concat(p, "|", 1, 4))
+        local panel = parsePillPos(table.concat(p, "|", 5, 8))
+        if pill and panel then return { pill = pill, panel = panel } end
+    end
+    return nil
+end
+
+local function lastSavedPill(text)
+    if type(text) ~= "string" then return nil, 0 end
+    local lastVal, lastTs = nil, 0
+    for v, ts in text:gmatch("%-%- PILLPOS ([%d%.%-|]+) (%d+)") do
+        lastVal, lastTs = v, tonumber(ts) or 0
+    end
+    return lastVal, lastTs
+end
+
+local function lastSavedLock(text)
+    if type(text) ~= "string" then return nil, -1 end
+    local lock, lastTs = nil, -1
+    for v, ts in text:gmatch("%-%- LOCKED ([01]) (%d+)") do
+        lock, lastTs = (v == "1"), tonumber(ts) or 0
+    end
+    return lock, lastTs
+end
+
+local function readSavedPill()
+    local bestPos, bestTs, bestFrom = nil, -1, nil
+    local bestLock, bestLockTs = nil, -1
+    local function consider(path, label)
+        local ok, text = pcall(readfile, path)
+        if not ok then return end
+        local val, ts = lastSavedPill(text)
+        local pos = parseSavedPos(val)
+        if pos and ts >= bestTs then
+            bestPos, bestTs, bestFrom = pos, ts, label .. ":" .. path
+        end
+        local lock, lts = lastSavedLock(text)
+        if lock ~= nil and lts >= bestLockTs then
+            bestLock, bestLockTs = lock, lts
+        end
+    end
+    for _, path in ipairs(SCRIPT_PATHS) do consider(path, "script") end
+    for _, path in ipairs(SIDECAR_PATHS) do consider(path, "sidecar") end
+    return bestPos, bestFrom, bestLock
+end
+
+local function posStr(u)
+    return string.format("%.4f|%.4f|%.0f|%.0f", u.X.Scale, u.Y.Scale, u.X.Offset, u.Y.Offset)
+end
+
+local function currentPillStr()
+    return posStr(floatBtn.Position) .. "|" .. posStr(main.Position)
+end
+
+local function savePillPos()
+    local val = currentPillStr()
+    local ts = tostring(os.time())
+    local data = "-- PILLPOS " .. val .. " " .. ts
+        .. "\n-- LOCKED " .. (locked and "1" or "0") .. " " .. ts
+    local okScript, okSide = false, false
+    for _, path in ipairs(SIDECAR_PATHS) do
+        if pcall(writefile, path, data) then okSide = true end
+    end
+    if type(appendfile) == "function" then
+        for _, path in ipairs(SCRIPT_PATHS) do
+            local ok = pcall(function()
+                local before = readfile(path)
+                appendfile(path, "\n" .. data .. "\n")
+                local after = readfile(path)
+                local kept = type(after) == "string" and #after >= #before + #data
+                    and after:sub(1, #before) == before
+                if not kept then pcall(writefile, path, before) end
+                return kept and lastSavedPill(after) == val
+            end)
+            if ok then okScript = true end
+        end
+    end
+    LOG("persist", "save ui pos=%s locked=%s script=%s sidecar=%s",
+        val, tostring(locked), tostring(okScript), tostring(okSide))
+    if okScript and okSide then return "script+sidecar" end
+    if okScript then return "script" end
+    if okSide then return "sidecar" end
+    return "none"
+end
+
+do
+    local okRead, saved, from, savedLock = pcall(readSavedPill)
+    if okRead and saved then
+        if saved.panel then main.Position = saved.panel end
+        if saved.pill then floatBtn.Position = saved.pill end
+        -- older saves (no LOCKED marker) were only written by /lock
+        if savedLock == nil then savedLock = true end
+        locked = savedLock
+        LOG("persist", "restored ui pos from %s (locked=%s)",
+            tostring(from), tostring(locked))
+    end
+    local ax, ay = floatAbs()
+    floatBtn.Position = clampFloatPos(ax, ay)
+    local px, py = panelAbs()
+    main.Position = clampPanelPos(px, py)
+end
+do
+    local fDrag, fStart, fBtnAx, fBtnAy, fMoved = false, nil, 0, 0, 0
+    floatBtn.InputBegan:Connect(function(input)
+        if not generationCurrent() then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            fDrag, fStart, fMoved = true, input.Position, 0
+            fBtnAx, fBtnAy = floatAbs()
+            LOG("drag", "float drag start (locked=%s)", tostring(locked))
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not generationCurrent() then return end
+        if not fDrag then return end
+        local st = input.UserInputState
+        if st == Enum.UserInputState.End or st == Enum.UserInputState.Cancel then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+            local d = input.Position - fStart
+            fMoved = d.Magnitude
+            if fMoved > 4 and not locked then
+                pcall(function() floatBtn.Position = clampFloatPos(fBtnAx + d.X, fBtnAy + d.Y) end)
+            end
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if not generationCurrent() then return end
+        if not fDrag then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            fDrag = false
+            if locked then
+                -- position frozen: snap back, tap still toggles panel
+                pcall(function() floatBtn.Position = clampFloatPos(fBtnAx, fBtnAy) end)
+                if fMoved <= 10 then
+                    if togglePanel then
+                        togglePanel("float locked")
+                    else
+                        main.Visible = not main.Visible
+                        LOG("ui", "float tapped (locked) -> panel visible=%s", tostring(main.Visible))
+                    end
+                else
+                    LOG("drag", "float move blocked (locked)")
+                end
+            elseif fMoved <= 10 then
+                if togglePanel then
+                    togglePanel("float")
+                else
+                    main.Visible = not main.Visible
+                    LOG("ui", "float tapped -> panel visible=%s", tostring(main.Visible))
+                end
+            else
+                local ax, ay = floatAbs()
+                LOG("drag", "float dropped at %d,%d", math.floor(ax), math.floor(ay))
+            end
+        end
+    end)
+end
+
+-- ================= feeds + bubbles =================
+local shownUpTo = 0
+local privateHistoryDone = false
+local frames = {}
+local order = 0
+local feeds = { Private = {}, Normal = {} }
+local vezOnline = false
+
+-- Real Roblox chat name colors: deterministic from the USERNAME (seed) using
+-- the TextChatService palette (Bright violet was replaced by Alder in 2022).
+-- Team members use their team color instead, matching Roblox's core chat.
+local NAME_COLORS = {
+    Color3.fromRGB(253, 41, 67),
+    Color3.fromRGB(1, 162, 255),
+    Color3.fromRGB(2, 184, 87),
+    Color3.fromRGB(180, 128, 255),
+    Color3.fromRGB(218, 133, 65),
+    Color3.fromRGB(245, 205, 48),
+    Color3.fromRGB(232, 186, 200),
+    Color3.fromRGB(215, 197, 154),
+}
+local function rawNameColor(seed)
+    local value = 0
+    local n = #seed
+    for i = 1, n do
+        local c = string.byte(seed, i)
+        local rev = n - i + 1
+        if n % 2 == 1 then rev = rev - 1 end
+        if rev % 4 >= 2 then c = -c end
+        value = value + c
+    end
+    return NAME_COLORS[(value % #NAME_COLORS) + 1]
+end
+local function nameColor(seed, plr)
+    if plr then
+        local ok, c = pcall(function()
+            if plr.Team ~= nil then return plr.TeamColor.Color end
+        end)
+        if ok and c then return c end
+    end
+    return rawNameColor(seed or "Guest")
+end
+local function esc(s)
+    return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+end
+
+local function renderBubble(name, text, isMe, color, isSystem)
+    order = order + 1
+    local ok, err = pcall(function()
+        -- built-in chat style: no bubble, text sits directly on the translucent panel
+        local f = Instance.new("Frame")
+        f.Size = UDim2.new(1, -4, 0, 0)
+        f.AutomaticSize = Enum.AutomaticSize.Y
+        f.BackgroundTransparency = 1
+        f.BorderSizePixel = 0
+        f.LayoutOrder = order
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop = UDim.new(0, isSystem and 1 or 2)
+        pad.PaddingBottom = UDim.new(0, isSystem and 1 or 2)
+        pad.PaddingLeft = UDim.new(0, isSystem and 2 or 3)
+        pad.PaddingRight = UDim.new(0, 3)
+        pad.Parent = f
+        local c = color or nameColor(isMe and lp.Name or name, isMe and lp or nil)
+        local line = Instance.new("TextLabel")
+        line.Size = UDim2.new(1, 0, 0, 0)
+        line.AutomaticSize = Enum.AutomaticSize.Y
+        line.BackgroundTransparency = 1
+        line.RichText = true
+        line.TextWrapped = true
+        line.TextXAlignment = Enum.TextXAlignment.Left
+        line.TextYAlignment = Enum.TextYAlignment.Top
+        line.TextSize = isSystem and 11 or 13
+        line.TextTransparency = isSystem and 0.2 or 0
+        line.TextStrokeTransparency = isSystem and 0.9 or 0.78
+        line.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+        line.Font = Enum.Font.Gotham
+        line.TextColor3 = TEXT_MAIN
+        local rgb = string.format("%d,%d,%d",
+            math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255))
+        if isSystem then
+            line.Text = string.format('<font size="11" color="rgb(%s)">%s: %s</font>',
+                rgb, esc(name), esc(text))
+        else
+            line.Text = string.format('<b><font size="12" color="rgb(%s)">%s</font></b>: %s',
+                rgb, esc(name), esc(text))
+        end
+        line.Parent = f
+        f.Parent = msgs
+        table.insert(frames, f)
+        if #frames > 70 then
+            local old = table.remove(frames, 1)
+            if old then old:Destroy() end
+        end
+    end)
+    if not ok then LOG("ui", "renderBubble fail: %s", tostring(err)) end
+    scrollMsgsBottom()
+end
+
+local function renderSeparator()
+    order = order + 1
+    local ok, err = pcall(function()
+        local f = Instance.new("Frame")
+        f.Name = "NewMessages"
+        f.Size = UDim2.new(1, -4, 0, 18)
+        f.BackgroundTransparency = 1
+        f.BorderSizePixel = 0
+        f.LayoutOrder = order
+        local left = Instance.new("Frame")
+        left.Name = "LineLeft"
+        left.Size = UDim2.new(0.5, -50, 0, 1)
+        left.Position = UDim2.new(0, 6, 0.5, 0)
+        left.BackgroundColor3 = TEXT_DIM
+        left.BackgroundTransparency = 0.65
+        left.BorderSizePixel = 0
+        left.Parent = f
+        local right = Instance.new("Frame")
+        right.Name = "LineRight"
+        right.Size = UDim2.new(0.5, -50, 0, 1)
+        right.Position = UDim2.new(0.5, 44, 0.5, 0)
+        right.BackgroundColor3 = TEXT_DIM
+        right.BackgroundTransparency = 0.65
+        right.BorderSizePixel = 0
+        right.Parent = f
+        local label = Instance.new("TextLabel")
+        label.Name = "Label"
+        label.AnchorPoint = Vector2.new(0.5, 0.5)
+        label.Position = UDim2.new(0.5, 0, 0.5, 0)
+        label.Size = UDim2.fromOffset(84, 14)
+        label.BackgroundTransparency = 1
+        label.Text = "New messages"
+        label.TextSize = 10
+        label.Font = Enum.Font.GothamBold
+        label.TextColor3 = TEXT_DIM
+        label.TextTransparency = 0.1
+        label.Parent = f
+        f.Parent = msgs
+        table.insert(frames, f)
+        if #frames > 70 then
+            local old = table.remove(frames, 1)
+            if old then old:Destroy() end
+        end
+    end)
+    if not ok then LOG("ui", "renderSeparator fail: %s", tostring(err)) end
+    scrollMsgsBottom()
+end
+
+-- store into a feed; render only when the active panel is visible, otherwise
+-- bump unread. Rendering while hidden made long history loads lag badly.
+-- seed = username used for the real name color; plr enables the team-color override
+-- opts: { system = true, color = Color3, silent = true (no unread badge) }
+local function panelVisible()
+    local ok, visible = pcall(function()
+        return main.Visible == true and gui.Enabled ~= false
+    end)
+    return ok and visible
+end
+
+local function storeMsg(feed, name, text, isMe, seed, plr, opts)
+    if type(text) ~= "string" or text:match("^%s*$") then return end
+    if type(name) ~= "string" or name == "" then name = "Guest" end
+    local f = feeds[feed]
+    if not f then LOG("msg", "bad feed %s", tostring(feed)) return end
+    opts = opts or {}
+    local color = opts.color or nameColor(seed or name, plr)
+    local isSystem = opts.system and true or false
+    table.insert(f, { name = name, text = text, isMe = isMe and true or false,
+        color = color, isSystem = isSystem })
+    if #f > 60 then table.remove(f, 1) end
+    if feed == activeTab and panelVisible() then
+        renderBubble(name, text, isMe, color, isSystem)
+    elseif not opts.silent then
+        unread = unread + 1
+        refreshFloat()
+    end
+end
+
+local function storeSeparator(feed)
+    local f = feeds[feed]
+    if not f then return end
+    table.insert(f, { sep = true })
+    if #f > 60 then table.remove(f, 1) end
+    if feed == activeTab and panelVisible() then renderSeparator() end
+end
+
+renderFeed = function(name)
+    for _, fr in ipairs(frames) do pcall(function() fr:Destroy() end) end
+    table.clear(frames)
+    order = 0
+    local feed = feeds[name]
+    if not feed then return end
+    for _, e in ipairs(feed) do
+        if e.sep then
+            renderSeparator()
+        else
+            renderBubble(e.name, e.text, e.isMe, e.color, e.isSystem)
+        end
+    end
+end
+
+local function paintTabs()
+    for name, btn in pairs(tabBtns) do
+        local sel = (name == activeTab)
+        btn.BackgroundTransparency = sel and 0.08 or 1
+        btn.TextColor3 = sel and Color3.fromRGB(255, 255, 255) or TEXT_DIM
+        btn.Font = sel and Enum.Font.GothamBold or Enum.Font.Gotham
+        local st = tabStrokes[name]
+        if st then
+            st.Color = sel and Color3.fromRGB(120, 190, 255) or Color3.fromRGB(255, 255, 255)
+            st.Transparency = sel and 0.75 or 1
+        end
+        if name == "Private" then
+            local dc = vezOnline and "0,200,0" or "255,60,60"
+            btn.RichText = true
+            btn.Text = string.format('<font color="rgb(%s)">●</font> Private', dc)
+        end
+    end
+end
+
+local PLACEHOLDERS = {
+    Private = "Message...",
+    Normal = "Message this server...",
+}
+local function switchTab(name)
+    if not feeds[name] then LOG("ui", "switchTab bad tab %s", tostring(name)) return end
+    activeTab = name
+    unread = 0
+    refreshFloat()
+    paintTabs()
+    renderFeed(name)
+    box.PlaceholderText = PLACEHOLDERS[name]
+    box.Text = ""
+    LOG("ui", "tab -> %s (%d msgs)", name, #feeds[name])
+end
+for tn, btn in pairs(tabBtns) do
+    btn.MouseButton1Click:Connect(function() switchTab(tn) end)
+end
+
+-- ================= Here channel discovery =================
+local hereCh = nil
+-- channels may live under TextChannels OR directly under TextChatService
+local function allChannels()
+    local out, seen = {}, {}
+    local function scan(container)
+        if not container then return end
+        for _, ch in ipairs(container:GetChildren()) do
+            if ch:IsA("TextChannel") and not seen[ch] then
+                seen[ch] = true
+                table.insert(out, ch)
+            end
+        end
+    end
+    pcall(function()
+        scan(TCS:FindFirstChild("TextChannels"))
+        scan(TCS)
+    end)
+    return out
+end
+local function channelRank(ch)
+    local name = tostring(ch.Name)
+    local lower = name:lower()
+    if name == "RBXGeneral" then return 100 end
+    if lower == "here" then return 90 end
+    if lower == "general" or lower == "all" then return 80 end
+    if lower:find("here", 1, true) then return 70 end
+    if lower:find("general", 1, true) or lower:find("all", 1, true) then return 60 end
+    if lower:find("global", 1, true) then return -100 end
+    if lower:find("system", 1, true) then return -90 end
+    if lower:find("team", 1, true) or lower:find("whisper", 1, true)
+        or lower:find("private", 1, true) then
+        return -50
+    end
+    return 10
+end
+local function pickHereChannel()
+    local tcsFolder = TCS:FindFirstChild("TextChannels")
+    local general = tcsFolder and tcsFolder:FindFirstChild("RBXGeneral")
+    if general and general.Parent then return general end
+    local best, bestRank = nil, -1000
+    for _, ch in ipairs(allChannels()) do
+        local rank = channelRank(ch)
+        if rank > bestRank then best, bestRank = ch, rank end
+    end
+    if best and bestRank >= 0 then return best end
+    return nil
+end
+local function findChannels()
+    local ok, err = pcall(function()
+        local pick = pickHereChannel()
+        if pick ~= hereCh then
+            if pick then
+                LOG("chat", "here channel -> %s", tostring(pick.Name))
+            elseif hereCh then
+                LOG("chat", "here channel lost (was %s)", tostring(hereCh.Name))
+            end
+            hereCh = pick
+        end
+    end)
+    if not ok then LOG("chat", "findChannels fail: %s", tostring(err)) end
+end
+local function getHere()
+    findChannels()
+    return (hereCh and hereCh.Parent) and hereCh or nil
+end
+task.spawn(function() -- warm in background (slow mobile replication)
+    LOG("chat", "warming channels...")
+    pcall(function() TCS:WaitForChild("TextChannels", 30) end)
+    if not generationCurrent() then return end
+    findChannels()
+    local n = #allChannels()
+    LOG("chat", "channels ready: %d (here=%s)", n, hereCh and hereCh.Name or "nil")
+end)
+
+-- ================= Private feed (VEZ) =================
+local function guessSender()
+    local other = nil
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp then
+            if other then return "Guest" end
+            other = p
+        end
+    end
+    if other then
+        local dn = other.DisplayName
+        if dn and dn ~= "" then return dn end
+        return other.Name
+    end
+    return "Guest"
+end
+
+local function playerForName(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    local exact, loose = {}, {}
+    local low = name:lower()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local dn = p.DisplayName
+        local un = p.Name
+        if (dn and dn ~= "" and dn == name) or un == name then
+            table.insert(exact, p)
+        elseif (dn and dn ~= "" and dn:lower() == low) or un:lower() == low then
+            table.insert(loose, p)
+        end
+    end
+    if #exact == 1 then return exact[1] end
+    if #exact == 0 and #loose == 1 then return loose[1] end
+    return nil
+end
+
+local customBubbles = {}
+local bubbleDisabledLogged = false
+
+local function bubbleStyle()
+    local cfg = TCS:FindFirstChildOfClass("BubbleChatConfiguration")
+    local style = {
+        enabled = true,
+        bg = Color3.fromRGB(250, 250, 250),
+        bgTrans = 0.1,
+        text = Color3.fromRGB(57, 59, 61),
+        size = 16,
+        font = Enum.Font.GothamMedium,
+        fontFace = nil,
+        duration = 30,
+        maxDist = 100,
+    }
+    if not cfg then return style end
+    local function prop(name, default)
+        local ok, v = pcall(function() return cfg[name] end)
+        if ok and v ~= nil then return v end
+        return default
+    end
+    if prop("Enabled", true) == false then style.enabled = false end
+    local bg = prop("BackgroundColor3", style.bg)
+    if typeof(bg) == "Color3" then style.bg = bg end
+    local bgTrans = tonumber(prop("BackgroundTransparency", style.bgTrans))
+    if bgTrans then style.bgTrans = math.clamp(bgTrans, 0, 1) end
+    local tc = prop("TextColor3", style.text)
+    if typeof(tc) == "Color3" then style.text = tc end
+    local ts = tonumber(prop("TextSize", style.size))
+    if ts then style.size = math.clamp(ts, 8, 40) end
+    local font = prop("Font", style.font)
+    if typeof(font) == "EnumItem" then style.font = font end
+    style.fontFace = prop("FontFace", nil)
+    local dur = tonumber(prop("BubbleDuration", style.duration))
+    if dur then style.duration = math.clamp(dur, 4, 30) end
+    local dist = tonumber(prop("MaxDistance", style.maxDist))
+    if dist then style.maxDist = math.clamp(dist, 20, 500) end
+    return style
+end
+
+local function showCustomBubble(ch, text, style)
+    local head = ch:FindFirstChild("Head")
+    if not head then head = ch:FindFirstChild("HumanoidRootPart") end
+    if not head then
+        for _, d in ipairs(ch:GetDescendants()) do
+            if d:IsA("BasePart") then head = d break end
+        end
+    end
+    if not head then return end
+    local old = customBubbles[ch]
+    if old and old.Parent then pcall(function() old:Destroy() end) end
+    local maxW = 240
+    local bounds
+    pcall(function()
+        bounds = game:GetService("TextService"):GetTextSize(
+            text, style.size, style.font, Vector2.new(maxW, 1000))
+    end)
+    local tw = bounds and bounds.X or math.min(maxW, #text * 8)
+    local th = bounds and bounds.Y or style.size * 1.3
+    tw = math.clamp(tw, 20, maxW)
+    local gui = Instance.new("BillboardGui")
+    gui.Name = "VEZPrivateBubble"
+    gui.Adornee = head
+    gui.AlwaysOnTop = true
+    gui.LightInfluence = 0
+    gui.MaxDistance = style.maxDist
+    gui.Size = UDim2.fromOffset(math.floor(tw + 18), math.floor(th + 12))
+    gui.StudsOffsetWorldSpace = Vector3.new(0, 2, 0)
+    local frame = Instance.new("Frame")
+    frame.Name = "Body"
+    frame.Size = UDim2.fromScale(1, 1)
+    frame.BackgroundColor3 = style.bg
+    frame.BackgroundTransparency = style.bgTrans
+    frame.BorderSizePixel = 0
+    frame.ZIndex = 2
+    frame.Parent = gui
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+    local tail = Instance.new("Frame")
+    tail.Name = "Tail"
+    tail.Size = UDim2.fromOffset(9, 9)
+    tail.AnchorPoint = Vector2.new(0.5, 0.5)
+    tail.Position = UDim2.new(0.5, 0, 1, -3)
+    tail.Rotation = 45
+    tail.BackgroundColor3 = style.bg
+    tail.BackgroundTransparency = style.bgTrans
+    tail.BorderSizePixel = 0
+    tail.ZIndex = 1
+    tail.Parent = gui
+    local tcorner = Instance.new("UICorner")
+    tcorner.CornerRadius = UDim.new(0, 2)
+    tcorner.Parent = tail
+    local label = Instance.new("TextLabel")
+    label.Name = "Text"
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, -18, 1, 0)
+    label.Position = UDim2.fromOffset(9, 0)
+    label.Font = style.font
+    if style.fontFace then pcall(function() label.FontFace = style.fontFace end) end
+    label.TextSize = style.size
+    label.TextColor3 = style.text
+    label.TextWrapped = true
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.Text = text
+    label.ZIndex = 3
+    label.Parent = gui
+    gui.Parent = head
+    customBubbles[ch] = gui
+    task.spawn(function()
+        task.wait(style.duration)
+        if customBubbles[ch] ~= gui then return end
+        customBubbles[ch] = nil
+        for i = 1, 8 do
+            if not gui.Parent then return end
+            local a = i / 8
+            frame.BackgroundTransparency = style.bgTrans + (1 - style.bgTrans) * a
+            tail.BackgroundTransparency = frame.BackgroundTransparency
+            label.TextTransparency = a
+            task.wait(0.04)
+        end
+        if gui.Parent then gui:Destroy() end
+    end)
+end
+
+local function showPrivateBubble(plr, text)
+    if not plr or type(text) ~= "string" then return end
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return end
+    if #text > 200 then text = text:sub(1, 200) end
+    local ch = plr.Character
+    if not ch then return end
+    local style = bubbleStyle()
+    if style.enabled then
+        local ok, err = pcall(function() TCS:DisplayBubble(ch, text) end)
+        if ok then return end
+        LOG("bubble", "DisplayBubble failed for %s: %s", plr.Name, tostring(err))
+    elseif not bubbleDisabledLogged then
+        bubbleDisabledLogged = true
+        LOG("bubble", "bubble chat disabled; using custom bubbles")
+    end
+    local ok, err = pcall(showCustomBubble, ch, text, style)
+    if not ok then LOG("bubble", "custom bubble failed for %s: %s", plr.Name, tostring(err)) end
+end
+
+-- The POST ack and the next poll can both contain the same message; suppress
+-- the short-lived duplicate without hiding genuinely repeated chat later.
+local vezRecent = {}
+local lastVezPrune = 0
+local function vezDuplicate(name, text)
+    local now = os.clock()
+    if now - lastVezPrune > 5 then
+        lastVezPrune = now
+        for k, t in pairs(vezRecent) do
+            if now - t > 2 then vezRecent[k] = nil end
+        end
+    end
+    local key = name .. "\0" .. text
+    local t = vezRecent[key]
+    if t and now - t < 2 then return true end
+    vezRecent[key] = now
+    return false
+end
+
+local function vezDisplay(raw, fromHistory)
+    if type(raw) ~= "string" then return end
+    raw = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    if raw == "" then return end
+    if raw:find(HEARTBEAT, 1, true) then return end
+    if raw:sub(1, 2) == "G|" then LOG("vez", "skip global message (tab removed)") return end
+    LOG("vez", "recv: %s", raw:sub(1, 120))
+    local name, text = raw:match("^(.-):%s*(.+)$")
+    if not name then
+        name, text = guessSender(), raw
+    else
+        name = name:gsub("%s+$", "")
+        if name == "" then name = guessSender() end
+    end
+    if not fromHistory and vezDuplicate(name, text) then
+        LOG("vez", "duplicate suppressed: %s", text:sub(1, 80))
+        return
+    end
+    local isMe = (name == myName)
+    local opts = fromHistory and { silent = true } or nil
+    if isMe then
+        storeMsg("Private", myName, text, true, lp.Name, lp, opts)
+        if not fromHistory then showPrivateBubble(lp, text) end
+    else
+        local target = playerForName(name)
+        if target == lp then target = nil end
+        local seed = target and target.Name or name
+        storeMsg("Private", name, text, false, seed, target, opts)
+        if not fromHistory and target then showPrivateBubble(target, text) end
+    end
+end
+
+local function handleBody(body)
+    if not body or body == "" then return end
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+    if not ok or type(data) ~= "table" then LOG("vez", "bad JSON body (%d bytes)", #body) return end
+    local list = data.list or data.msgs
+    if type(data.msg) == "string" then
+        vezDisplay(data.msg)
+    elseif type(list) == "table" then
+        local initial = not privateHistoryDone
+        if #list < shownUpTo then shownUpTo = 0 LOG("vez", "server list reset") end -- server cleared/restarted
+        local start = shownUpTo + 1
+        if initial and #list - start + 1 > 60 then
+            start = #list - 59
+            LOG("vez", "history trimmed to last %d msgs", #list - start + 1)
+        end
+        for i = start, #list do
+            if type(list[i]) == "string" then vezDisplay(list[i], initial) end
+        end
+        shownUpTo = #list
+        if initial then
+            privateHistoryDone = true
+            if #list > 0 then storeSeparator("Private") end
+        end
+    end
+end
+
+local function vezSend(text)
+    local full = myName .. ": " .. text
+    LOG("vez", "send: %s", text:sub(1, 120))
+    task.spawn(function()
+        local ok, res = doRequest(REMOTE, "POST", HttpService:JSONEncode({ m = full }))
+        LOG("vez", "POST ok=%s", tostring(ok))
+        if ok and res and res.Body then handleBody(res.Body) end
+    end)
+end
+
+local pollStarted = false
+local function startVezPoll()
+    if pollStarted then return end
+    pollStarted = true
+    task.spawn(function()
+        local fails = 0
+        while generationCurrent() do
+            pcall(findChannels) -- keep Here discovery fresh (late replication)
+            local ok, res = doRequest(REMOTE_MSGS, "GET", nil)
+            if not generationCurrent() then break end
+            local online = ok and res and res.Success and res.Body and res.Body ~= "" and true or false
+            if online ~= vezOnline then
+                vezOnline = online
+                LOG("vez", "online=%s", tostring(vezOnline))
+            end
+            if not online then
+                fails = fails + 1
+                if fails == 1 or fails % 10 == 0 then LOG("vez", "poll fail #%d ok=%s", fails, tostring(ok)) end
+            else
+                fails = 0
+                pcall(handleBody, res.Body)
+            end
+            pcall(paintTabs)
+            task.wait(1)
+        end
+    end)
+end
+
+-- ================= Normal feed (Roblox chat) =================
+local seenMsgIds = {}
+local seenMsgOrder = {}
+local seenMsgCount = 0
+local SEEN_MSG_LIMIT = 500
+local recentLegacy = {}
+local lastLegacyPrune = 0
+
+-- tracks our own sends so the server echo lands back in the tab it was sent from
+local pendingOwn = {}
+local function noteOwn(text, tab)
+    local now = os.clock()
+    for i = #pendingOwn, 1, -1 do
+        if now - pendingOwn[i].t > 8 then table.remove(pendingOwn, i) end
+    end
+    table.insert(pendingOwn, { text = text, tab = tab, t = now })
+end
+local function consumeOwn(text)
+    local now = os.clock()
+    for i = #pendingOwn, 1, -1 do
+        local e = pendingOwn[i]
+        if now - e.t > 8 then
+            table.remove(pendingOwn, i)
+        elseif e.text == text then
+            table.remove(pendingOwn, i)
+            return e.tab
+        end
+    end
+    return nil
+end
+
+-- cross-server senders aren't in this server: resolve names via userId (cached)
+local nameCache = {}
+local nameCacheOrder = {}
+local nameCacheCount = 0
+local NAME_CACHE_LIMIT = 200
+
+-- System colors: the default RBXSystem styling wraps the text in a rich-text
+-- <font color="..."> tag; games can also set ChatWindowMessageProperties or
+-- legacy ExtraData.Color. Parse the real color and fall back to light gray.
+local SYSTEM_COLOR = Color3.fromRGB(180, 180, 185)
+local COLOR_NAMES = {
+    white = { 255, 255, 255 }, black = { 0, 0, 0 }, red = { 255, 0, 0 },
+    green = { 0, 255, 0 }, blue = { 0, 0, 255 }, yellow = { 255, 255, 0 },
+    orange = { 255, 165, 0 }, gray = { 163, 162, 165 }, grey = { 163, 162, 165 },
+    silver = { 163, 162, 165 },
+}
+local function parseCssColor(s)
+    if type(s) ~= "string" then return nil end
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    local hex = s:match("^#(%x%x%x%x%x%x)$")
+    if hex then
+        return Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
+    end
+    local r3, g3, b3 = s:match("^#(%x)(%x)(%x)$")
+    if r3 then
+        return Color3.fromRGB(tonumber(r3 .. r3, 16), tonumber(g3 .. g3, 16), tonumber(b3 .. b3, 16))
+    end
+    local r, g, b = s:match("^rgb%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*%)$")
+    if r then return Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)) end
+    local named = COLOR_NAMES[s:lower()]
+    if named then return Color3.fromRGB(named[1], named[2], named[3]) end
+    return nil
+end
+local function colorFromRich(text)
+    if type(text) ~= "string" then return nil end
+    local v = text:match('<font[^>]-color%s*=%s*"([^"]+)"')
+        or text:match("<font[^>]-color%s*=%s*'([^']+)'")
+    return parseCssColor(v)
+end
+local function systemColor(tm)
+    local c = colorFromRich(tm.Text) or colorFromRich(tm.PrefixText)
+    if c then return c end
+    local ok, props = pcall(function() return tm.ChatWindowMessageProperties end)
+    if ok and props then
+        local ok2, pc = pcall(function() return props.TextColor3 end)
+        if ok2 and typeof(pc) == "Color3" then return pc end
+    end
+    local meta = tm.Metadata
+    if type(meta) == "string" and meta:lower():find("error", 1, true) then
+        return Color3.fromRGB(255, 85, 85)
+    end
+    return nil
+end
+local function legacySystemColor(data)
+    if type(data) ~= "table" then return nil end
+    local extra = data.ExtraData
+    if type(extra) == "table" then
+        local ok, c = pcall(function() return extra.Color or extra.TextColor3 end)
+        if ok and typeof(c) == "Color3" then return c end
+    end
+    local ok, c = pcall(function() return data.Color end)
+    if ok and typeof(c) == "Color3" then return c end
+    return nil
+end
+
+-- server system messages are shown in BOTH tabs, silently (no unread badge)
+local function showSystem(text, source, color)
+    if type(text) ~= "string" then return end
+    local c = colorFromRich(text) or color
+    if not c or typeof(c) ~= "Color3" then c = SYSTEM_COLOR end
+    text = text:gsub("<[^>]*>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return end
+    LOG("chat", "system[%s] color=%d,%d,%d: %s", tostring(source),
+        math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255), text:sub(1, 100))
+    local opts = { system = true, color = c, silent = true }
+    storeMsg("Normal", "System", text, false, nil, nil, opts)
+    storeMsg("Private", "System", text, false, nil, nil, opts)
+end
+
+-- plr == nil + userId == nil means a system message.
+-- The legacy [GLOBAL] tag is stripped; messages land in Normal.
+local function routeRoblox(plr, text, metadata, channel, userId, sysColor)
+    if type(text) ~= "string" then return end
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return end
+    if text:sub(1, #GLOBAL_TAG) == GLOBAL_TAG then
+        text = text:sub(#GLOBAL_TAG + 1):gsub("^%s+", "")
+        if text == "" then return end
+    end
+    if not plr then
+        if userId and userId > 0 then
+            task.spawn(function()
+                local nm = nameCache[userId]
+                if not nm then
+                    local ok, un = pcall(function() return Players:GetNameFromUserIdAsync(userId) end)
+                    nm = (ok and un and un ~= "") and un or ("User" .. tostring(userId))
+                    nameCache[userId] = nm
+                    nameCacheCount = nameCacheCount + 1
+                    table.insert(nameCacheOrder, userId)
+                    if nameCacheCount > NAME_CACHE_LIMIT then
+                        local old = table.remove(nameCacheOrder, 1)
+                        if old then
+                            nameCache[old] = nil
+                            nameCacheCount = nameCacheCount - 1
+                        end
+                    end
+                end
+                if not generationCurrent() then return end
+                storeMsg("Normal", nm, text, false, nm)
+            end)
+        else
+            showSystem(text, "service", sysColor)
+        end
+        return
+    end
+    local isMe = (plr == lp)
+    local dn = plr.DisplayName
+    local nm = ((dn and dn ~= "") and dn) or plr.Name
+    if isMe then
+        -- echo of our own send: back to its tab (or Normal if typed in default UI)
+        local tab = consumeOwn(text)
+        storeMsg(tab or "Normal", nm, text, true, lp.Name, lp)
+        return
+    end
+    storeMsg("Normal", nm, text, false, plr.Name, plr)
+end
+
+-- modern TextChatService path (official pattern per Roblox docs)
+local function seenIds(tm)
+    local id = tm.MessageId
+    if type(id) ~= "string" or id == "" then return false end
+    if seenMsgIds[id] then return true end
+    seenMsgIds[id] = true
+    seenMsgCount = seenMsgCount + 1
+    table.insert(seenMsgOrder, id)
+    if seenMsgCount > SEEN_MSG_LIMIT then
+        local old = table.remove(seenMsgOrder, 1)
+        if old then
+            seenMsgIds[old] = nil
+            seenMsgCount = seenMsgCount - 1
+        end
+    end
+    return false
+end
+do
+    local ok, err = pcall(function()
+        TCS.MessageReceived:Connect(function(tm)
+            if not generationCurrent() then return end
+            local iok, ierr = pcall(function()
+                if not tm then return end
+                if tm.Status == Enum.TextChatMessageStatus.Sending then return end
+                if seenIds(tm) then return end
+                local txt = tm.Text
+                if type(txt) ~= "string" or txt == "" then return end
+                local plr, uid = nil, nil
+                if tm.TextSource then
+                    uid = tm.TextSource.UserId
+                    if uid and uid > 0 then
+                        pcall(function() plr = Players:GetPlayerByUserId(uid) end)
+                    else
+                        uid = nil
+                    end
+                end
+                routeRoblox(plr, txt, tm.Metadata, tm.TextChannel, uid,
+                    (not plr and not uid) and systemColor(tm) or nil)
+            end)
+            if not iok then LOG("chat", "MessageReceived handler fail: %s", tostring(ierr)) end
+        end)
+    end)
+    LOG("chat", "MessageReceived hook ok=%s err=%s", tostring(ok), tostring(err))
+end
+-- legacy chat fallback (NON-BLOCKING: old code yielded 5s+5s on main thread -> looked like load fail)
+task.spawn(function()
+    local ok, err = pcall(function()
+        LOG("chat", "checking legacy DefaultChatSystemChatEvents...")
+        local evs = ReplicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 5)
+        if not generationCurrent() then return end
+        if not evs then LOG("chat", "no legacy chat (modern game)") return end
+        local done = evs:FindFirstChild("OnMessageDoneFiltering")
+        if done then
+            done.OnClientEvent:Connect(function(data)
+                if not generationCurrent() then return end
+                if type(data) ~= "table" then return end
+                local txt = data.Message
+                if type(txt) ~= "string" or txt == "" then return end
+                local key = tostring(data.FromSpeaker) .. "\0" .. txt
+                local now = os.clock()
+                if now - lastLegacyPrune > 5 then
+                    lastLegacyPrune = now
+                    for k, t in pairs(recentLegacy) do
+                        if now - t > 3 then recentLegacy[k] = nil end
+                    end
+                end
+                if recentLegacy[key] and (now - recentLegacy[key]) < 3 then return end
+                recentLegacy[key] = now
+                local plr = nil
+                local sid = tonumber(data.SpeakerUserId or "")
+                if sid and sid > 0 then
+                    plr = Players:GetPlayerByUserId(sid)
+                elseif data.FromSpeaker and data.FromSpeaker ~= "" and data.FromSpeaker ~= "System" then
+                    plr = Players:FindFirstChild(data.FromSpeaker)
+                end
+                routeRoblox(plr, txt, nil, nil, sid, legacySystemColor(data))
+            end)
+            LOG("chat", "legacy player hook attached")
+        end
+        -- system/announcement messages arrive on a separate legacy event
+        local sys = evs:FindFirstChild("OnNewSystemMessage") or evs:FindFirstChild("SystemMessage")
+        if sys then
+            sys.OnClientEvent:Connect(function(data)
+                if not generationCurrent() then return end
+                local txt = data
+                if type(data) == "table" then txt = data.Message or data.Text end
+                if type(txt) == "string" then showSystem(txt, "legacy", legacySystemColor(data)) end
+            end)
+            LOG("chat", "legacy system hook attached (%s)", sys.Name)
+        end
+        if not done and not sys then LOG("chat", "no legacy chat events found") end
+    end)
+    if not ok then LOG("chat", "legacy hook fail: %s", tostring(err)) end
+end)
+
+-- Normal goes to the Here channel; legacy fallback if TextChatService is absent.
+local function robloxSend(text, tab)
+    LOG("chat", "robloxSend tab=%s len=%d", tab, #text)
+    local h = getHere()
+    if h then
+        local ok = pcall(function() h:SendAsync(text) end)
+        LOG("chat", "send here ok=%s", tostring(ok))
+        if ok then return true, text end
+    end
+    local out = text
+    local sent = false
+    pcall(function()
+        local evs = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+        local req = evs and evs:FindFirstChild("SayMessageRequest")
+        if req then req:FireServer(out, "All") sent = true end
+    end)
+    LOG("chat", "legacy send sent=%s", tostring(sent))
+    if sent then return true, out end
+    return false, nil
+end
+
+-- one-time diagnostic: report which chat channels this game/client actually has
+task.spawn(function()
+    pcall(function() TCS:WaitForChild("TextChannels", 20) end)
+    task.wait(2)
+    if not generationCurrent() then return end
+    findChannels()
+    local names = {}
+    for _, ch in ipairs(allChannels()) do
+        table.insert(names, ch.Name)
+    end
+    table.sort(names)
+    LOG("chat", "channels: %s", table.concat(names, ", "))
+end)
+
+-- ================= input routing =================
+local function setLocked(v)
+    locked = v and true or false
+    LOG("ui", "setLocked=%s", tostring(locked))
+    local okSave, info = pcall(savePillPos)
+    local saveInfo = " Saved: " .. (okSave and tostring(info) or "fail") .. "."
+    storeMsg(activeTab, "System",
+        (locked and "Locked: panel + chat icon frozen (/unlock to move)"
+            or "Unlocked: drag header / pill to move (/lock to freeze)") .. saveInfo, false)
+end
+
+-- /l: send the icon's + panel's current (locked) position to the webhook
+local function logIconPos()
+    local ax, ay = floatAbs()
+    local px, py = panelAbs()
+    local vs = viewport()
+    local p = floatBtn.Position
+    local pp = main.Position
+    local tab = activeTab
+    local payload = {
+        command = "/l",
+        locked = locked,
+        icon = {
+            absoluteX = math.floor(ax * 10 + 0.5) / 10,
+            absoluteY = math.floor(ay * 10 + 0.5) / 10,
+            scaleX = p.X.Scale,
+            scaleY = p.Y.Scale,
+            offsetX = p.X.Offset,
+            offsetY = p.Y.Offset,
+        },
+        panel = {
+            absoluteX = math.floor(px * 10 + 0.5) / 10,
+            absoluteY = math.floor(py * 10 + 0.5) / 10,
+            scaleX = pp.X.Scale,
+            scaleY = pp.Y.Scale,
+            offsetX = pp.X.Offset,
+            offsetY = pp.Y.Offset,
+        },
+        viewport = { width = vs.X, height = vs.Y },
+        placeId = tostring(game.PlaceId),
+        jobId = tostring(game.JobId),
+        player = myName,
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    task.spawn(function()
+        local ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
+        if not ok then
+            LOG("webhook", "/l JSONEncode fail: %s", tostring(body))
+            storeMsg(tab, "System", "/l failed (json encode)", false)
+            return
+        end
+        local callOK, reqOK, res = pcall(doRequest, WEBHOOK_URL, "POST", body)
+        local sent = callOK and reqOK
+        local code = 0
+        if sent and type(res) == "table" then
+            code = res.StatusCode or (res.Success and 200) or 0
+        end
+        LOG("webhook", "/l send ok=%s code=%s icon=%d,%d locked=%s",
+            tostring(sent), tostring(code), math.floor(ax), math.floor(ay), tostring(locked))
+        storeMsg(tab, "System", string.format("/l logged icon %d,%d (locked=%s, http=%s)",
+            math.floor(ax), math.floor(ay), tostring(locked), sent and tostring(code) or "fail"), false)
+    end)
+end
+
+local function sendText(text)
+    if not text then return end
+    -- TextBox:FocusLost can deliver a trailing newline; never forward it as a
+    -- second empty chat line (or as part of a VEZ payload).
+    local clean = text:gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if clean == "" then return end
+    local cmd = clean:lower()
+    if cmd == "/lock" then setLocked(true) return end
+    if cmd == "/unlock" then setLocked(false) return end
+    if cmd == "/l" then logIconPos() return end
+    if activeTab == "Private" then
+        vezSend(clean)
+    else
+        local tab = activeTab
+        task.spawn(function()
+            -- record the EXACT outgoing text so the echo matches back to this tab
+            local ok, out = robloxSend(clean, tab)
+            if ok and out then
+                noteOwn(out, tab)
+            else
+                LOG("chat", "send FAILED tab=%s", tab)
+                storeMsg(tab, "System", "Couldn't send (Roblox blocked it)", false)
+            end
+        end)
+    end
+end
+
+sendBtn.MouseButton1Click:Connect(function()
+    sendText(box.Text)
+    box.Text = ""
+end)
+box.FocusLost:Connect(function(enter)
+    if enter then
+        sendText(box.Text)
+        box.Text = ""
+    end
+end)
+-- NOTE: no Chatted hook on purpose: Roblox fires lp.Chatted for our own
+-- SendAsync sends too, which used to leak Normal messages into Private.
+
+-- ================= init =================
+switchTab("Private")
+do
+    local names, n = {}, 0
+    pcall(function()
+        for _, p in ipairs(Players:GetPlayers()) do
+            n = n + 1
+            local dn = (p.DisplayName and p.DisplayName ~= "") and p.DisplayName or p.Name
+            table.insert(names, dn .. (p == lp and " (you)" or ""))
+        end
+    end)
+    storeMsg("Private", "System", "players here (" .. n .. "): " .. table.concat(names, ", "), false)
+    storeMsg("Private", "System", "VEZ chat loaded! Tap the chat icon in the topbar (or the floating CHAT pill fallback) to open. Drag the header to move the panel; /lock /unlock freezes it, /lock saves positions for next execute, /l logs icon pos.", false)
+end
+startVezPoll()
+unread = 0
+refreshFloat()
+LOG("boot", "script loaded OK (parent=%s)", parentGui:GetFullName())
+bootPing("ready")
